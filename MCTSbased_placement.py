@@ -296,8 +296,6 @@ def hpwl_from_positions(x: jnp.ndarray,
 # Constructive action space
 # -----------------------------
 
-ordered_modules: jnp.ndarray  # The order in which modules are placed
-
 class PlacementState(NamedTuple):
     """State for constructive placement"""
     s1: jnp.ndarray           # Current sequence 1 (partially built)
@@ -390,8 +388,58 @@ def make_recurrent_fn(widths: jnp.ndarray, heights: jnp.ndarray,
                 update_orientation
             )
         )
+
+        # jax.debug.print("After action {a}, step {s}", a=action, s=state.step)
+        # jax.debug.print("s1: {s1}", s1=state.s1)
+        # jax.debug.print("s2: {s2}", s2=state.s2)
+        # jax.debug.print("orientations: {o}", o=state.orientations)
         
         return state
+    
+    def policy_function(state: PlacementState) -> jnp.ndarray:
+        """A simple policy function for rollout (uniform over valid actions)"""
+        step_type = state.step % 3
+        module_idx = state.step // 3
+        num_placed = module_idx
+        
+        max_actions = num_movable + 1
+        
+        # Mask valid actions
+        valid_mask = jax.lax.cond(
+            state.step >= 3 * num_movable,
+            lambda: jnp.zeros(max_actions, dtype=bool),
+            lambda: jax.lax.cond(
+                step_type < 2,
+                lambda: jnp.arange(max_actions) <= num_placed,
+                lambda: jnp.arange(max_actions) < 4
+            )
+        )
+        
+        logits = jnp.where(valid_mask, 0.0, -1e9)
+        return logits
+    
+    def rollout(state: PlacementState, rng_key):
+        '''
+        Plays a game until the end and returns the reward from the perspective of the initial player.
+        '''
+        def cond(a):
+            state, key = a
+            return state.step < 3 * num_movable
+        def step(a):
+            state, key = a
+            key, subkey = jax.random.split(key)
+            action = jax.random.categorical(subkey, policy_function(state))
+            state = apply_action(state, action)
+            # jax.debug.print("step: {s}", s=state.step)
+            # jax.debug.print("action: {a}", a=action)
+            # jax.debug.print("s1: {s1}", s1=state.s1)
+            # jax.debug.print("s2: {s2}", s2=state.s2)
+            # jax.debug.print("orientations: {o}", o=state.orientations)
+            return state, key
+        leaf, key = jax.lax.while_loop(cond, step, (state, rng_key))
+        # The leaf reward is from the perspective of the last player.
+        # We negate it if the last player is not the initial player.
+        return compute_reward(leaf)
     
     def compute_reward(state: PlacementState) -> jnp.ndarray:
         """Compute reward (only at terminal state)"""
@@ -445,28 +493,9 @@ def make_recurrent_fn(widths: jnp.ndarray, heights: jnp.ndarray,
         # Compute reward
         reward = compute_reward(new_state)
         
-        # Set up prior for next step
-        step_type = new_state.step % 3
-        module_idx = new_state.step // 3
-        num_placed = module_idx
-        
-        max_actions = num_movable + 1
-        
-        # Mask valid actions (only if not terminal)
-        valid_mask = jax.lax.cond(
-            is_terminal,
-            lambda: jnp.zeros(max_actions, dtype=bool),
-            lambda: jax.lax.cond(
-                step_type < 2,
-                lambda: jnp.arange(max_actions) <= num_placed,
-                lambda: jnp.arange(max_actions) < 4
-            )
-        )
-        prior_logits = jnp.where(valid_mask, 0.0, -1e9)
-        
         return mctx.RecurrentFnOutput(
-            prior_logits=prior_logits,
-            value=jnp.array(0.0, dtype=jnp.float32),
+            prior_logits=policy_function(new_state),
+            value=rollout(new_state, rng_key),
             reward=reward,
             discount=jnp.where(is_terminal, 0.0, 1.0),
         ), new_state
@@ -624,7 +653,7 @@ def main():
     ap.add_argument('--blocks', default="apte.blocks", help='Path to .blocks file')
     ap.add_argument('--nets', default="apte.nets", help='Path to .nets file')
     ap.add_argument('--pl', default="apte.pl", help='Path to .pl file (for terminals)')
-    ap.add_argument('--sims', type=int, default=200, help='MCTS simulations')
+    ap.add_argument('--sims', type=int, default=100, help='MCTS simulations')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--batch', type=int, default=1, help='Batch size for parallel roots')
 
@@ -645,17 +674,25 @@ def main():
     print(f"Movable modules: {num_movable}")
     print(f"Terminal/fixed nodes: {onp.sum(bench.is_terminal)}")
     print(f"Nets: {len(bench.nets_ptr) - 1}")
+
+    print("Initial HPWL calculation...")
+    # Initial placement: terminals at fixed positions, movables at (0,0)
+    hpwl_init = hpwl_from_positions(
+        jnp.where(movable_mask, 0.0, bench.x_fixed),
+        jnp.where(movable_mask, 0.0, bench.y_fixed),
+        jnp.array(bench.widths),
+        jnp.array(bench.heights),
+        jnp.array(bench.nets_ptr),
+        jnp.array(bench.pins_nodes),
+        jnp.array(bench.pins_dx),
+        jnp.array(bench.pins_dy)
+    )
+    print(f"Initial HPWL (movables at origin): {float(hpwl_init):.2f}")
     
     # Sort movable modules by area (decreasing)
     areas = bench.widths[movable_indices] * bench.heights[movable_indices]
     sorted_order = onp.argsort(-areas)  # Descending order
     ordered_modules = movable_indices[sorted_order]
-    
-    print(f"\nModule placement order (by decreasing area):")
-    for i, idx in enumerate(ordered_modules[:5]):
-        print(f"  {i+1}. {bench.names[idx]}: {bench.widths[idx]:.1f} x {bench.heights[idx]:.1f}")
-    if num_movable > 5:
-        print(f"  ... and {num_movable - 5} more")
     
     # Create initial state
     initial_state = create_initial_state(num_movable)
