@@ -9,42 +9,33 @@ import mctx
 from typing import Callable, Tuple
 
 from placement_state import PlacementState, StateManager
-from hpwl_calculator import HPWLCalculator
+from placement_solver import PlacementSolver
 from sequence_pair import SequencePairSolver
 
 
 class MCTSPlacer:
     """MCTS布局器"""
     
-    def __init__(self, widths: jnp.ndarray, heights: jnp.ndarray,
-                 nets_ptr: jnp.ndarray, pins_nodes: jnp.ndarray,
-                 pins_dx: jnp.ndarray, pins_dy: jnp.ndarray,
-                 num_movable: int, movable_indices: jnp.ndarray,
-                 sorted_modules: jnp.ndarray):
-        """初始化MCTS布局器"""
-        self.widths = widths
-        self.heights = heights
-        self.nets_ptr = nets_ptr
-        self.pins_nodes = pins_nodes
-        self.pins_dx = pins_dx
-        self.pins_dy = pins_dy
-        self.num_movable = num_movable
+    def __init__(self, bench, movable_indices: jnp.ndarray, sorted_modules: jnp.ndarray):
+        """初始化MCTS布局器
+        
+        Args:
+            bench: BookshelfData对象
+            movable_indices: 可移动模块的索引
+            sorted_modules: 排序后的模块
+        """
+        # 存储必要的数据
         self.movable_indices = movable_indices
         self.sorted_modules = sorted_modules
+        self.num_movable = len(movable_indices)
+        self.max_actions = self.num_movable
+        self.bench = bench  # 存储bench对象
         
         # 创建状态管理器
         self.state_manager = StateManager()
         
-        # 预计算常用值以提高性能
-        self._precompute_constants()
-    
-    def _precompute_constants(self):
-        """预计算常用常量以提高性能"""
-        # 预计算可移动模块的宽度和高度
-        self.movable_widths = self.widths[self.movable_indices]
-        self.movable_heights = self.heights[self.movable_indices]
-        # 预计算最大动作数␍␊
-        self.max_actions = self.num_movable
+        # 创建布局求解器
+        self.placement_solver = PlacementSolver(bench, movable_indices)
     
     def root_fn(self, state: PlacementState, max_actions: int, rng_key) -> mctx.RootFnOutput:
         """MCTS根函数"""
@@ -60,35 +51,12 @@ class MCTSPlacer:
         logits = jnp.where(valid_mask, 0.0, -1e9)
         return logits
     
-    def _apply_orientations(self, state: PlacementState) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """应用方向到宽度和高度"""
-        w = self.movable_widths
-        h = self.movable_heights
-        
-        # 为E/W方向（1, 3）交换宽度/高度
-        should_swap = (state.orientations == 1) | (state.orientations == 3)
-        w_final = jnp.where(should_swap, h, w)
-        h_final = jnp.where(should_swap, w, h)
-        
-        return w_final, h_final
     
     def _compute_final_positions(self, state: PlacementState) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """计算最终位置"""
-        # 应用方向
-        w_final, h_final = self._apply_orientations(state)
-        
-        # 从序列对获取位置
-        x_mov, y_mov = SequencePairSolver.seqpair_to_positions(
-            state.s1, state.s2, w_final, h_final
+        return self.placement_solver.compute_final_positions(
+            state.s1, state.s2, state.orientations
         )
-        
-        # 与固定终端合并
-        x = jnp.zeros_like(self.widths)
-        y = jnp.zeros_like(self.heights)
-        x = x.at[self.movable_indices].set(x_mov)
-        y = y.at[self.movable_indices].set(y_mov)
-        
-        return x, y
     
     def rollout(self, state: PlacementState, rng_key) -> jnp.ndarray:
         """执行rollout直到结束并返回奖励"""
@@ -111,13 +79,9 @@ class MCTSPlacer:
         is_terminal = self.state_manager.is_terminal(state, self.num_movable)
         
         def terminal_reward():
-            # 使用优化的位置计算
-            x, y = self._compute_final_positions(state)
-            
-            # 计算HPWL
-            hpwl = HPWLCalculator.calculate_hpwl(
-                x, y, self.widths, self.heights, 
-                self.nets_ptr, self.pins_nodes, self.pins_dx, self.pins_dy
+            # 使用布局求解器计算HPWL
+            hpwl = self.placement_solver.compute_hpwl(
+                state.s1, state.s2, state.orientations
             )
             return -hpwl  # 负值因为我们想要最小化
         

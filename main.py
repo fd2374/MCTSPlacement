@@ -16,7 +16,7 @@ import functools
 from data_loader import BookshelfLoader
 from placement_state import StateManager, PlacementState
 from mcts_placer import MCTSPlacer
-from hpwl_calculator import HPWLCalculator
+from placement_solver import PlacementSolver
 from visualizer import PlacementVisualizer
 from config import PlacementConfig
 
@@ -77,13 +77,7 @@ class PlacementRunner:
         
         # 创建MCTS布局器
         placer = MCTSPlacer(
-            jnp.array(self.bench.widths),
-            jnp.array(self.bench.heights),
-            jnp.array(self.bench.nets_ptr),
-            jnp.array(self.bench.pins_nodes),
-            jnp.array(self.bench.pins_dx),
-            jnp.array(self.bench.pins_dy),
-            self.num_movable,
+            self.bench,
             jnp.array(self.movable_indices),
             ordered_modules
         )
@@ -206,15 +200,8 @@ class PlacementRunner:
         full_y_coords = full_y_coords.at[self.movable_indices].set(y_coords)
         
         # 计算最终HPWL
-        final_hpwl = HPWLCalculator.calculate_hpwl(
-            full_x_coords, full_y_coords,
-            jnp.array(self.bench.widths),
-            jnp.array(self.bench.heights),
-            jnp.array(self.bench.nets_ptr),
-            jnp.array(self.bench.pins_nodes),
-            jnp.array(self.bench.pins_dx),
-            jnp.array(self.bench.pins_dy)
-        )
+        placement_solver = PlacementSolver(self.bench, self.movable_indices)
+        final_hpwl = placement_solver.compute_hpwl_from_positions(full_x_coords, full_y_coords)
         
         print(f"最终HPWL: {float(final_hpwl):.2f}")
         print(f"序列对 s1: {best_state.s1}")
@@ -277,15 +264,10 @@ def main():
     print("计算初始HPWL...")
     # 初始布局：终端在固定位置，可移动模块在(0,0)
     movable_mask = runner.bench.is_terminal == 0
-    initial_hpwl = HPWLCalculator.calculate_hpwl(
+    placement_solver = PlacementSolver(runner.bench, runner.movable_indices)
+    initial_hpwl = placement_solver.compute_hpwl_from_positions(
         jnp.where(movable_mask, 0.0, runner.bench.x_fixed),
-        jnp.where(movable_mask, 0.0, runner.bench.y_fixed),
-        jnp.array(runner.bench.widths),
-        jnp.array(runner.bench.heights),
-        jnp.array(runner.bench.nets_ptr),
-        jnp.array(runner.bench.pins_nodes),
-        jnp.array(runner.bench.pins_dx),
-        jnp.array(runner.bench.pins_dy)
+        jnp.where(movable_mask, 0.0, runner.bench.y_fixed)
     )
     print(f"初始HPWL: {float(initial_hpwl):.2f}")
     

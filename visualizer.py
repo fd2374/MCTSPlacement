@@ -19,7 +19,7 @@ class PlacementVisualizer:
     
     @staticmethod
     def plot_placement(bench: BookshelfData, x: np.ndarray, y: np.ndarray, 
-                      movable_indices: np.ndarray, output_path: str = "output_placement.png", draw_connections: bool = True):
+                      movable_indices: np.ndarray, output_path: str = "output_placement.png", draw_connections: bool = False):
         """绘制最终布局，包含模块和网络"""
         try:
             import matplotlib.pyplot as plt
