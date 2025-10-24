@@ -28,9 +28,9 @@ class MCTSPlacer:
         self.pins_nodes = pins_nodes
         self.pins_dx = pins_dx
         self.pins_dy = pins_dy
-        self.num_movable = int(num_movable)
+        self.num_movable = num_movable
         self.movable_indices = movable_indices
-        self.sorted_modules = jnp.asarray(sorted_modules, dtype=jnp.int32)
+        self.sorted_modules = sorted_modules
         
         # 创建状态管理器
         self.state_manager = StateManager()
@@ -40,12 +40,11 @@ class MCTSPlacer:
     
     def _precompute_constants(self):
         """预计算常用常量以提高性能"""
-        # 预计算按放置顺序的可移动模块宽度和高度
-        self.ordered_widths = self.widths[self.sorted_modules]
-        self.ordered_heights = self.heights[self.sorted_modules]
-        
-        # 预计算最大动作数
-        self.max_actions = max(self.num_movable + 1, 4)
+        # 预计算可移动模块的宽度和高度
+        self.movable_widths = self.widths[self.movable_indices]
+        self.movable_heights = self.heights[self.movable_indices]
+        # 预计算最大动作数␍␊
+        self.max_actions = self.num_movable
     
     def root_fn(self, state: PlacementState, max_actions: int, rng_key) -> mctx.RootFnOutput:
         """MCTS根函数"""
@@ -63,8 +62,8 @@ class MCTSPlacer:
     
     def _apply_orientations(self, state: PlacementState) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """应用方向到宽度和高度"""
-        w = self.ordered_widths
-        h = self.ordered_heights
+        w = self.movable_widths
+        h = self.movable_heights
         
         # 为E/W方向（1, 3）交换宽度/高度
         should_swap = (state.orientations == 1) | (state.orientations == 3)
@@ -73,7 +72,7 @@ class MCTSPlacer:
         
         return w_final, h_final
     
-    def _compute_final_positions(self, state: PlacementState) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def _compute_final_positions(self, state: PlacementState) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """计算最终位置"""
         # 应用方向
         w_final, h_final = self._apply_orientations(state)
@@ -86,15 +85,10 @@ class MCTSPlacer:
         # 与固定终端合并
         x = jnp.zeros_like(self.widths)
         y = jnp.zeros_like(self.heights)
-        x = x.at[self.sorted_modules].set(x_mov)
-        y = y.at[self.sorted_modules].set(y_mov)
+        x = x.at[self.movable_indices].set(x_mov)
+        y = y.at[self.movable_indices].set(y_mov)
         
-        widths_all = self.widths
-        heights_all = self.heights
-        widths_all = widths_all.at[self.sorted_modules].set(w_final)
-        heights_all = heights_all.at[self.sorted_modules].set(h_final)
-        
-        return x, y, widths_all, heights_all
+        return x, y
     
     def rollout(self, state: PlacementState, rng_key) -> jnp.ndarray:
         """执行rollout直到结束并返回奖励"""
@@ -118,11 +112,11 @@ class MCTSPlacer:
         
         def terminal_reward():
             # 使用优化的位置计算
-            x, y, widths_all, heights_all = self._compute_final_positions(state)
+            x, y = self._compute_final_positions(state)
             
             # 计算HPWL
             hpwl = HPWLCalculator.calculate_hpwl(
-                x, y, widths_all, heights_all, 
+                x, y, self.widths, self.heights, 
                 self.nets_ptr, self.pins_nodes, self.pins_dx, self.pins_dy
             )
             return -hpwl  # 负值因为我们想要最小化

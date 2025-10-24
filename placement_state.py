@@ -33,10 +33,8 @@ class StateManager:
     def apply_action(state: PlacementState, action: jnp.ndarray, 
                     num_movable: int, sorted_modules: jnp.ndarray) -> PlacementState:
         """应用动作到状态"""
-        del sorted_modules  # 排序信息保留接口，当前逻辑无需直接使用
         step_type = state.step % 3  # 0: s1填充, 1: s2填充, 2: 方向
-        module_idx = state.step // 3
-        action = jnp.asarray(action, dtype=jnp.int32)
+        module_idx = sorted_modules[state.step // 3]
         
         def update_s1():
             """将当前模块放入s1的空位"""
@@ -69,18 +67,18 @@ class StateManager:
     def get_valid_actions(state: PlacementState, num_movable: int) -> jnp.ndarray:
         """获取有效动作掩码"""
         step_type = state.step % 3
-        max_actions = max(num_movable + 1, 4)
+        max_actions = num_movable
         
         def placement_mask(seq: jnp.ndarray) -> jnp.ndarray:
             mask = jnp.zeros(max_actions, dtype=jnp.bool_)
             available = seq == -1
-            mask = mask.at[:num_movable].set(available)
+            mask = mask.at[:max_actions].set(available)
             return mask
         
         def orientation_mask() -> jnp.ndarray:
             mask = jnp.zeros(max_actions, dtype=jnp.bool_)
-            limit = min(max_actions, 4)
-            mask = mask.at[:limit].set(True)
+            #will be error if max_actions < 4
+            mask = mask.at[:4].set(True)
             return mask
         
         valid_mask = jax.lax.cond(
