@@ -19,7 +19,7 @@ class PlacementVisualizer:
     
     @staticmethod
     def plot_placement(bench: BookshelfData, x: np.ndarray, y: np.ndarray, 
-                      movable_indices: np.ndarray, output_path: str = "output_placement.png"):
+                      movable_indices: np.ndarray, output_path: str = "output_placement.png", draw_connections: bool = True):
         """绘制最终布局，包含模块和网络"""
         try:
             import matplotlib.pyplot as plt
@@ -73,18 +73,26 @@ class PlacementVisualizer:
                     pin_x.append(px)
                     pin_y.append(py)
             
-            # 绘制连接此网络中所有引脚的线（从第一个引脚的星形拓扑）
-            if len(pin_x) > 1:
-                for i in range(1, len(pin_x)):
-                    ax.plot([pin_x[0], pin_x[i]], [pin_y[0], pin_y[i]], 
+            # 绘制连接此网络中所有引脚的线（连接到物理重心）
+            if len(pin_x) > 1 and draw_connections:
+                # 计算物理重心
+                center_x = np.mean(pin_x)
+                center_y = np.mean(pin_y)
+                
+                # 绘制从每个引脚到重心的连接线
+                for i in range(len(pin_x)):
+                    ax.plot([pin_x[i], center_x], [pin_y[i], center_y], 
                            'orange', alpha=0.4, linewidth=0.8)
                 
+                # 绘制重心点
+                ax.scatter(center_x, center_y, c='red', s=20, zorder=6, alpha=0.8, marker='x')
+                
                 # 绘制引脚点
-                ax.scatter(pin_x, pin_y, c='orange', s=10, zorder=5, alpha=0.6)
+            ax.scatter(pin_x, pin_y, c='orange', s=10, zorder=5, alpha=0.6)
         
         ax.set_xlabel('X', fontsize=12)
         ax.set_ylabel('Y', fontsize=12)
-        ax.set_title('最终布局与网络', fontsize=14)
+        ax.set_title('Final Placement', fontsize=14)
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
         

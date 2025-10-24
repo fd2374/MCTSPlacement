@@ -11,9 +11,7 @@ from typing import Optional
 class PlacementConfig:
     """布局算法配置"""
     # 文件路径
-    blocks_path: str = "apte.blocks"
-    nets_path: str = "apte.nets"
-    pl_path: Optional[str] = "apte.pl"
+    base_path: str = "apte"  # 基础路径，会自动添加 .blocks, .nets, .pl 后缀
     
     # MCTS参数
     num_simulations: int = 100

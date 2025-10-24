@@ -72,6 +72,41 @@ class BookshelfLoader:
             pins_dx=np.asarray(pins_dx, dtype=np.float32),
             pins_dy=np.asarray(pins_dy, dtype=np.float32),
         )
+    
+    @staticmethod
+    def load_bookshelf_from_base_path(base_path: str) -> BookshelfData:
+        """从基础路径加载Bookshelf数据
+        
+        Args:
+            base_path: 基础路径，如 "./data/apte"，会自动添加 .blocks, .nets, .pl 后缀
+            
+        Returns:
+            BookshelfData对象
+        """
+        import os
+        
+        # 构建文件路径
+        blocks_path = f"{base_path}.blocks"
+        nets_path = f"{base_path}.nets"
+        pl_path = f"{base_path}.pl"
+        
+        # 检查文件是否存在
+        if not os.path.exists(blocks_path):
+            raise FileNotFoundError(f"Blocks file not found: {blocks_path}")
+        if not os.path.exists(nets_path):
+            raise FileNotFoundError(f"Nets file not found: {nets_path}")
+        
+        # 检查.pl文件是否存在（可选）
+        if not os.path.exists(pl_path):
+            print(f"Warning: PL file not found: {pl_path}, using default positions")
+            pl_path = None
+        
+        print(f"Loading Bookshelf data from base path: {base_path}")
+        print(f"  Blocks: {blocks_path}")
+        print(f"  Nets: {nets_path}")
+        print(f"  PL: {pl_path if pl_path else 'None (using defaults)'}")
+        
+        return BookshelfLoader.load_bookshelf(blocks_path, nets_path, pl_path)
 
     @staticmethod
     def _parse_blocks(path: str) -> Tuple[List[str], List[float], List[float], List[int]]:

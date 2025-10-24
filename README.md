@@ -67,8 +67,21 @@
 
 ## 使用方法
 
+### 新的简化方式（推荐）
 ```bash
-# 基本用法
+# 基本用法 - 只需要指定基础路径
+python main.py --base-path "data/apte"
+
+# 自定义参数
+python main.py --base-path "data/apte" --sims 200 --seed 42 --output results/
+
+# 禁用某些功能
+python main.py --base-path "data/apte" --no-tree --no-viz
+```
+
+### 兼容旧版本方式
+```bash
+# 旧版本方式（仍然支持）
 python main.py --blocks apte.blocks --nets apte.nets --pl apte.pl
 
 # 自定义参数
@@ -80,9 +93,10 @@ python main.py --no-tree --no-viz
 
 ## 配置参数
 
-- `--blocks`: .blocks文件路径
-- `--nets`: .nets文件路径  
-- `--pl`: .pl文件路径
+### 新的简化参数
+- `--base-path`: 基础路径（会自动添加.blocks, .nets, .pl后缀）
+
+### 通用参数
 - `--sims`: MCTS模拟次数
 - `--seed`: 随机种子
 - `--batch`: 批处理大小
@@ -90,6 +104,11 @@ python main.py --no-tree --no-viz
 - `--gumbel-scale`: Gumbel缩放因子
 - `--no-tree`: 不保存搜索树图
 - `--no-viz`: 不保存可视化
+
+### 兼容旧版本参数
+- `--blocks`: .blocks文件路径
+- `--nets`: .nets文件路径  
+- `--pl`: .pl文件路径
 
 ## 依赖项
 
