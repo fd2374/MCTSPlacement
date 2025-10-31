@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 import numpy as np
+import jax.numpy as jnp
 
 
 def _strip_comments(line: str) -> str:
@@ -37,15 +38,15 @@ class BookshelfData:
         pins_dy: 引脚Y方向偏移数组，形状为(P,)，以百分比表示
     """
     names: List[str]                 # 所有节点名称
-    widths: np.ndarray              # 宽度数组 (G,)
-    heights: np.ndarray             # 高度数组 (G,)
-    is_terminal: np.ndarray         # 是否为终端节点 (G,)
-    x_fixed: np.ndarray             # 固定X坐标 (G,)
-    y_fixed: np.ndarray             # 固定Y坐标 (G,)
-    nets_ptr: np.ndarray            # 网络指针 (M+1,)
-    pins_nodes: np.ndarray          # 引脚节点索引 (P,)
-    pins_dx: np.ndarray             # 引脚X偏移 (P,)
-    pins_dy: np.ndarray             # 引脚Y偏移 (P,)
+    widths: jnp.ndarray              # 宽度数组 (G,)
+    heights: jnp.ndarray             # 高度数组 (G,)
+    is_terminal: jnp.ndarray         # 是否为终端节点 (G,)
+    x_fixed: jnp.ndarray             # 固定X坐标 (G,)
+    y_fixed: jnp.ndarray             # 固定Y坐标 (G,)
+    nets_ptr: jnp.ndarray            # 网络指针 (M+1,)
+    pins_nodes: jnp.ndarray          # 引脚节点索引 (P,)
+    pins_dx: jnp.ndarray             # 引脚X偏移 (P,)
+    pins_dy: jnp.ndarray             # 引脚Y偏移 (P,)
 
 
 class BookshelfLoader:
@@ -62,15 +63,15 @@ class BookshelfLoader:
         
         return BookshelfData(
             names=names,
-            widths=np.asarray(widths, dtype=np.float32),
-            heights=np.asarray(heights, dtype=np.float32),
-            is_terminal=np.asarray(is_term, dtype=np.int32),
-            x_fixed=np.asarray(x_fixed, dtype=np.float32),
-            y_fixed=np.asarray(y_fixed, dtype=np.float32),
-            nets_ptr=np.asarray(nets_ptr, dtype=np.int32),
-            pins_nodes=np.asarray(pins_nodes, dtype=np.int32),
-            pins_dx=np.asarray(pins_dx, dtype=np.float32),
-            pins_dy=np.asarray(pins_dy, dtype=np.float32),
+            widths=jnp.asarray(widths, dtype=np.float32),
+            heights=jnp.asarray(heights, dtype=np.float32),
+            is_terminal=jnp.asarray(is_term, dtype=np.int32),
+            x_fixed=jnp.asarray(x_fixed, dtype=np.float32),
+            y_fixed=jnp.asarray(y_fixed, dtype=np.float32),
+            nets_ptr=jnp.asarray(nets_ptr, dtype=np.int32),
+            pins_nodes=jnp.asarray(pins_nodes, dtype=np.int32),
+            pins_dx=jnp.asarray(pins_dx, dtype=np.float32),
+            pins_dy=jnp.asarray(pins_dy, dtype=np.float32),
         )
     
     @staticmethod

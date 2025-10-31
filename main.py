@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import numpy as np
 import jax
 import jax.numpy as jnp
 import mctx
@@ -37,6 +36,7 @@ class PlacementRunner:
         self.bench = None
         self.movable_indices = None
         self.num_movable = 0
+        self.placer = None  # MCTS布局器
         
     def load_benchmark(self) -> None:
         """加载基准测试数据"""
@@ -44,12 +44,12 @@ class PlacementRunner:
         
         # 识别可移动模块
         movable_mask = self.bench.is_terminal == 0
-        self.movable_indices = np.where(movable_mask)[0]
+        self.movable_indices = jnp.where(movable_mask)[0]
         self.num_movable = len(self.movable_indices)
         
         print(f"总节点数: {len(self.bench.names)}")
         print(f"可移动模块: {self.num_movable}")
-        print(f"终端/固定节点: {np.sum(self.bench.is_terminal)}")
+        print(f"终端/固定节点: {jnp.sum(self.bench.is_terminal)}")
         print(f"网络数: {len(self.bench.nets_ptr) - 1}")
         
     
@@ -57,7 +57,7 @@ class PlacementRunner:
         """准备模块排序"""
         # 按面积排序可移动模块（降序）
         areas = self.bench.widths[self.movable_indices] * self.bench.heights[self.movable_indices]
-        sorted_order = np.argsort(-areas)  # 降序
+        sorted_order = jnp.argsort(-areas)  # 降序
         ordered_modules = self.movable_indices[sorted_order]
         return jnp.array(ordered_modules)
     
@@ -101,6 +101,9 @@ class PlacementRunner:
             gumbel_scale=self.config.gumbel_scale,
             qtransform=functools.partial(mctx.qtransform_completed_by_mix_value)
         )
+        
+        # 保存placer作为实例属性，以便后续使用
+        self.placer = placer
         
         # 从搜索树中提取所有终端状态和对应的奖励
         best_terminal_state, best_reward = self._extract_best_terminal_state(
@@ -173,35 +176,18 @@ class PlacementRunner:
         print("\n" + "="*50)
         print("最佳布局结果")
         print("="*50)
-        
-        # 从最佳状态计算坐标
-        from sequence_pair import SequencePairSolver
-        
-        # 只使用可移动模块的尺寸
-        movable_widths = self.bench.widths[self.movable_indices]
-        movable_heights = self.bench.heights[self.movable_indices]
-        
-        # 转换序列对为坐标
-        x_coords, y_coords = SequencePairSolver.seqpair_to_positions(
-            best_state.s1, best_state.s2,
-            movable_widths, movable_heights
+
+        x_coords, y_coords, w_final, h_final, pins_dx, pins_dy = self.placer.placement_solver.compute_final_positions(
+            best_state.s1, best_state.s2, best_state.orientations
         )
-        
-        # 构建完整的坐标数组（包含固定模块）
-        full_x_coords = jnp.zeros(len(self.bench.names))
-        full_y_coords = jnp.zeros(len(self.bench.names))
-        
-        # 设置固定模块的坐标
-        full_x_coords = full_x_coords.at[self.bench.is_terminal == 1].set(self.bench.x_fixed[self.bench.is_terminal == 1])
-        full_y_coords = full_y_coords.at[self.bench.is_terminal == 1].set(self.bench.y_fixed[self.bench.is_terminal == 1])
-        
-        # 设置可移动模块的坐标
-        full_x_coords = full_x_coords.at[self.movable_indices].set(x_coords)
-        full_y_coords = full_y_coords.at[self.movable_indices].set(y_coords)
-        
-        # 计算最终HPWL
-        placement_solver = PlacementSolver(self.bench, self.movable_indices)
-        final_hpwl = placement_solver.compute_hpwl_from_positions(full_x_coords, full_y_coords)
+
+        final_hpwl = self.placer.placement_solver.compute_hpwl(
+            best_state.s1, best_state.s2, best_state.orientations
+        )
+
+        # compute_final_positions 已经返回了包含所有模块（包括固定终端）的完整坐标数组
+        full_x_coords = x_coords
+        full_y_coords = y_coords
         
         print(f"最终HPWL: {float(final_hpwl):.2f}")
         print(f"序列对 s1: {best_state.s1}")
@@ -211,8 +197,12 @@ class PlacementRunner:
         # 绘制布局图
         PlacementVisualizer.plot_placement(
             self.bench, 
-            np.array(full_x_coords), 
-            np.array(full_y_coords),
+            jnp.array(full_x_coords), 
+            jnp.array(full_y_coords),
+            jnp.array(w_final),
+            jnp.array(h_final),
+            jnp.array(pins_dx),
+            jnp.array(pins_dy),
             self.movable_indices,
             f"{self.config.output_dir}/best_placement.png"
         )
@@ -259,17 +249,6 @@ def main():
     
     # 加载基准测试
     runner.load_benchmark()
-    
-    # 计算初始HPWL
-    print("计算初始HPWL...")
-    # 初始布局：终端在固定位置，可移动模块在(0,0)
-    movable_mask = runner.bench.is_terminal == 0
-    placement_solver = PlacementSolver(runner.bench, runner.movable_indices)
-    initial_hpwl = placement_solver.compute_hpwl_from_positions(
-        jnp.where(movable_mask, 0.0, runner.bench.x_fixed),
-        jnp.where(movable_mask, 0.0, runner.bench.y_fixed)
-    )
-    print(f"初始HPWL: {float(initial_hpwl):.2f}")
     
     # 运行MCTS
     policy_output, best_state, placer = runner.run_mcts()

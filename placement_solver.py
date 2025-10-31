@@ -34,21 +34,6 @@ class PlacementSolver:
         self.fixed_x = jnp.array(bench.x_fixed)
         self.fixed_y = jnp.array(bench.y_fixed)
         self.is_terminal = jnp.array(bench.is_terminal)
-        
-        # 创建HPWL计算器
-        self.hpwl_calc = self._create_hpwl_calculator()
-    
-    def _create_hpwl_calculator(self):
-        """创建预绑定的HPWL计算器"""
-        return functools.partial(
-            self._calculate_hpwl_core,
-            widths=jnp.array(self.bench.widths),
-            heights=jnp.array(self.bench.heights),
-            nets_ptr=jnp.array(self.bench.nets_ptr),
-            pins_nodes=jnp.array(self.bench.pins_nodes),
-            pins_dx=jnp.array(self.bench.pins_dx),
-            pins_dy=jnp.array(self.bench.pins_dy)
-        )
     
     @staticmethod
     @jax.jit
@@ -94,7 +79,7 @@ class PlacementSolver:
         hpwl = jnp.sum((maxx - minx) + (maxy - miny))
         return hpwl
     
-    def _apply_orientations(self, orientations: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def _apply_orientations(self, orientations: jnp.ndarray):
         """应用方向到宽度和高度"""
         w = self.movable_widths
         h = self.movable_heights
@@ -104,10 +89,18 @@ class PlacementSolver:
         w_final = jnp.where(should_swap, h, w)
         h_final = jnp.where(should_swap, w, h)
         
-        return w_final, h_final
+        # 对于每个引脚，根据其所属模块的方向决定是否翻转偏移量
+        pin_orientations = orientations[self.bench.pins_nodes]
+        should_swap_pins_dx = (pin_orientations == 2) | (pin_orientations == 3)
+        should_swap_pins_dy = (pin_orientations == 1) | (pin_orientations == 2)
+        
+        pins_dx = jnp.where(should_swap_pins_dx, -self.bench.pins_dx, self.bench.pins_dx)
+        pins_dy = jnp.where(should_swap_pins_dy, self.bench.pins_dy, -self.bench.pins_dy)
+        
+        return w_final, h_final, pins_dx, pins_dy
     
     def compute_final_positions(self, s1: jnp.ndarray, s2: jnp.ndarray, 
-                               orientations: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+                               orientations: jnp.ndarray):
         """
         计算最终位置坐标
         
@@ -119,7 +112,7 @@ class PlacementSolver:
             (x, y): 最终坐标
         """
         # 应用方向
-        w_final, h_final = self._apply_orientations(orientations)
+        w_final, h_final, pins_dx, pins_dy = self._apply_orientations(orientations)
         
         # 从序列对获取位置
         x_mov, y_mov = SequencePairSolver.seqpair_to_positions(
@@ -137,8 +130,11 @@ class PlacementSolver:
         # 设置固定终端的坐标
         x = jnp.where(self.is_terminal == 1, self.fixed_x, x)
         y = jnp.where(self.is_terminal == 1, self.fixed_y, y)
-        
-        return x, y
+
+        w_final_all = self.bench.widths.at[self.movable_indices].set(w_final)
+        h_final_all = self.bench.heights.at[self.movable_indices].set(h_final)
+
+        return x, y, w_final_all, h_final_all, pins_dx, pins_dy
     
     def compute_hpwl(self, s1: jnp.ndarray, s2: jnp.ndarray, 
                      orientations: jnp.ndarray) -> jnp.ndarray:
@@ -152,17 +148,6 @@ class PlacementSolver:
         Returns:
             HPWL值
         """
-        x, y = self.compute_final_positions(s1, s2, orientations)
-        return self.hpwl_calc(x, y)
-    
-    def compute_hpwl_from_positions(self, x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-        """
-        从坐标直接计算HPWL
-        
-        Args:
-            x, y: 模块坐标
-            
-        Returns:
-            HPWL值
-        """
-        return self.hpwl_calc(x, y)
+        x, y, w_final, h_final, pins_dx, pins_dy = self.compute_final_positions(s1, s2, orientations)
+        return self._calculate_hpwl_core(x, y, w_final, h_final, self.bench.nets_ptr, 
+        self.bench.pins_nodes, pins_dx, pins_dy)

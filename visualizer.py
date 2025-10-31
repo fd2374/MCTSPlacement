@@ -18,7 +18,7 @@ class PlacementVisualizer:
     """布局可视化器"""
     
     @staticmethod
-    def plot_placement(bench: BookshelfData, x: np.ndarray, y: np.ndarray, 
+    def plot_placement(bench: BookshelfData, x: np.ndarray, y: np.ndarray, widths: np.ndarray, heights: np.ndarray, pins_dx: np.ndarray, pins_dy: np.ndarray,
                       movable_indices: np.ndarray, output_path: str = "output_placement.png", draw_connections: bool = False):
         """绘制最终布局，包含模块和网络"""
         try:
@@ -31,8 +31,8 @@ class PlacementVisualizer:
         fig, ax = plt.subplots(1, 1, figsize=(12, 12))
         
         # 绘制模块
-        for i, (name, w, h, is_term) in enumerate(zip(bench.names, bench.widths, 
-                                                      bench.heights, bench.is_terminal)):
+        for i, (name, w, h, is_term) in enumerate(zip(bench.names, widths, 
+                                                      heights, bench.is_terminal)):
             xi, yi = x[i], y[i]
             if np.isnan(xi) or np.isnan(yi):
                 continue
@@ -49,8 +49,8 @@ class PlacementVisualizer:
             ax.add_patch(rect)
         
         # 绘制网络连接
-        centers_x = x + 0.5 * bench.widths
-        centers_y = y + 0.5 * bench.heights
+        centers_x = x + 0.5 * widths
+        centers_y = y + 0.5 * heights
         
         num_nets = len(bench.nets_ptr) - 1
         for net_idx in range(num_nets):
@@ -62,12 +62,12 @@ class PlacementVisualizer:
             pin_y = []
             for pin_idx in range(start, end):
                 node_idx = bench.pins_nodes[pin_idx]
-                dx_pct = bench.pins_dx[pin_idx]
-                dy_pct = bench.pins_dy[pin_idx]
+                dx_pct = pins_dx[pin_idx]
+                dy_pct = pins_dy[pin_idx]
                 
                 # 计算带偏移的引脚位置
-                px = centers_x[node_idx] + (dx_pct / 100.0) * bench.widths[node_idx]
-                py = centers_y[node_idx] + (dy_pct / 100.0) * bench.heights[node_idx]
+                px = centers_x[node_idx] + (dx_pct / 100.0) * widths[node_idx]
+                py = centers_y[node_idx] + (dy_pct / 100.0) * heights[node_idx]
                 
                 if not np.isnan(px) and not np.isnan(py):
                     pin_x.append(px)

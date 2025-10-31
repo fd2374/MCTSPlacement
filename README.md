@@ -11,6 +11,7 @@
 - **`data_loader.py`** - 数据加载模块
   - `BookshelfData`: 存储Bookshelf格式数据的数据类
   - `BookshelfLoader`: 解析.blocks、.nets、.pl文件的加载器
+  - `load_bookshelf_from_base_path()`: 从基础路径自动加载三个文件
 
 - **`placement_state.py`** - 布局状态管理
   - `PlacementState`: 表示布局状态的命名元组
@@ -19,15 +20,20 @@
 - **`sequence_pair.py`** - 序列对算法
   - `SequencePairSolver`: 将序列对转换为坐标位置
 
-- **`hpwl_calculator.py`** - HPWL计算
-  - `HPWLCalculator`: 计算半周长线长
-  - `calculate_hpwl()`: 计算给定布局的HPWL值
+- **`placement_solver.py`** - 布局求解器（新增）
+  - `PlacementSolver`: 统一处理状态到坐标转换和HPWL计算
+  - `compute_final_positions()`: 从状态计算最终坐标
+  - `compute_hpwl()`: 计算HPWL值
+  - 使用`functools.partial`预绑定bench数据，提供简洁的API
 
 - **`mcts_placer.py`** - MCTS布局算法
   - `MCTSPlacer`: 实现MCTS搜索和策略
+  - 简化构造函数，直接使用bench对象
+  - 委托布局计算给PlacementSolver
 
 - **`visualizer.py`** - 可视化模块
   - `PlacementVisualizer`: 生成布局图和搜索树图
+  - 支持网络连接可视化（重心连接模式）
 
 - **`config.py`** - 配置管理
   - `PlacementConfig`: 算法参数配置
@@ -40,29 +46,37 @@
 ### 1. 模块化设计
 - 将原始的单一大文件拆分为多个功能模块
 - 每个模块职责单一，便于维护和测试
+- 新增`placement_solver.py`统一处理布局计算
 
-### 2. 改进的命名规范
-- 使用更清晰的类名和函数名
-- 遵循Python命名约定
+### 2. 简化的API设计
+- **统一的数据输入**：只需指定`--base-path`，自动加载三个文件
+- **简化的构造函数**：MCTSPlacer和PlacementSolver只需传入bench对象
+- **functools.partial优化**：预绑定bench数据，提供更简洁的调用接口
 
 ### 3. 性能优化
-- 预计算常用值
-- 减少重复代码
-- 优化JAX函数
+- 消除数据重复存储，直接使用bench对象
+- 使用`functools.partial`预绑定数据，减少重复转换
+- 优化JAX函数，减少内存占用
 
-### 4. 类型注解和文档
+### 4. 代码清理
+- 删除冗余的预计算和存储代码
+- 职责分离：MCTSPlacer专注算法，PlacementSolver处理布局
+- 消除数据重复，单一数据源
+
+### 5. 类型注解和文档
 - 添加完整的类型注解
 - 详细的文档字符串
 - 清晰的参数说明
 
-### 5. 配置管理
+### 6. 配置管理
 - 统一的配置类
 - 参数验证
 - 灵活的命令行接口
 
-### 6. 增强的可视化
+### 7. 增强的可视化
 - 搜索树节点显示状态信息（s1, s2, orientations）
 - 英文标签
+- 网络连接可视化（重心连接模式）
 - 更清晰的图形表示
 
 ## 使用方法
@@ -78,11 +92,6 @@ python main.py --base-path "data/apte" --sims 200 --seed 42 --output results/
 # 禁用某些功能
 python main.py --base-path "data/apte" --no-tree --no-viz
 ```
-
-### 兼容旧版本方式
-```bash
-# 旧版本方式（仍然支持）
-python main.py --blocks apte.blocks --nets apte.nets --pl apte.pl
 
 # 自定义参数
 python main.py --sims 200 --seed 42 --output results/
@@ -105,11 +114,6 @@ python main.py --no-tree --no-viz
 - `--no-tree`: 不保存搜索树图
 - `--no-viz`: 不保存可视化
 
-### 兼容旧版本参数
-- `--blocks`: .blocks文件路径
-- `--nets`: .nets文件路径  
-- `--pl`: .pl文件路径
-
 ## 依赖项
 
 ```bash
@@ -118,8 +122,9 @@ pip install jax jaxlib mctx numpy matplotlib pygraphviz
 
 ## 输出文件
 
-- `search_tree.png`: MCTS搜索树可视化
-- `placement_result.json`: 布局结果统计
+- `search_tree.png`: MCTS搜索树可视化（包含状态信息）
+- `best_placement.png`: 最佳布局结果可视化
+- 控制台输出：初始HPWL、最终HPWL、序列对信息
 
 ## 技术特点
 
@@ -128,3 +133,10 @@ pip install jax jaxlib mctx numpy matplotlib pygraphviz
 - **序列对表示**: 高效的布局表示方法
 - **HPWL优化**: 最小化半周长线长
 - **模块化设计**: 易于扩展和维护
+- **functools.partial**: 预绑定数据，提供简洁API
+- **职责分离**: 清晰的模块边界和单一职责
+
+### 性能提升
+- **内存优化**: 消除数据重复存储
+- **计算优化**: 预绑定减少重复转换
+- **代码简化**: 减少维护成本
