@@ -213,7 +213,7 @@ class PlacementRunner:
 def create_config_from_args() -> PlacementConfig:
     """从命令行参数创建配置"""
     parser = argparse.ArgumentParser(description='重构的MCTS序列对布局器（终端奖励 = -HPWL）')
-    parser.add_argument('--base-path', default="apte", help='基础路径（会自动添加.blocks, .nets, .pl后缀）')
+    parser.add_argument('--base-path', default="./data/apte", help='基础路径（会自动添加.blocks, .nets, .pl后缀）')
     parser.add_argument('--sims', type=int, default=100, help='MCTS模拟次数')
     parser.add_argument('--seed', type=int, default=0, help='随机种子')
     parser.add_argument('--batch', type=int, default=1, help='并行根节点的批处理大小')
