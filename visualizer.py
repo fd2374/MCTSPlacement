@@ -98,7 +98,6 @@ class PlacementVisualizer:
         
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"\n布局可视化已保存到: {output_path}")
         plt.close()
 
     @staticmethod

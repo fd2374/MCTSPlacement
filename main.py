@@ -112,6 +112,7 @@ class PlacementRunner:
         
         print(f"  Best terminal reward: {float(best_reward):.4f}")
         print(f"  Best terminal state: s1={best_terminal_state.s1}, s2={best_terminal_state.s2}")
+        print(f"  Best terminal state: orientations={best_terminal_state.orientations}")
         
         return policy_output, best_terminal_state, placer
     
@@ -188,11 +189,6 @@ class PlacementRunner:
         # compute_final_positions 已经返回了包含所有模块（包括固定终端）的完整坐标数组
         full_x_coords = x_coords
         full_y_coords = y_coords
-        
-        print(f"最终HPWL: {float(final_hpwl):.2f}")
-        print(f"序列对 s1: {best_state.s1}")
-        print(f"序列对 s2: {best_state.s2}")
-        print(f"方向: {best_state.orientations}")
         
         # 绘制布局图
         PlacementVisualizer.plot_placement(

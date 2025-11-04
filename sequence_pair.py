@@ -35,32 +35,26 @@ class SequencePairSolver:
         pos1 = jnp.zeros(N, dtype=jnp.int32).at[s1].set(jnp.arange(N))
         pos2 = jnp.zeros(N, dtype=jnp.int32).at[s2].set(jnp.arange(N))
         
-        # 使用向量化操作优化X坐标计算
-        def compute_x_coordinates():
-            x = jnp.zeros(N, dtype=jnp.float32)
-            for i in range(N):
-                mod_i = s1[i]
-                # 模块j在mod_i左边当且仅当：
-                # j在s1和s2中都出现在mod_i之前
-                mask = (pos1 < pos1[mod_i]) & (pos2 < pos2[mod_i])
-                # x[mod_i]必须至少是x[j] + width[j]对于所有在左边的j
-                x_candidates = jnp.where(mask, x + widths, 0.0)
-                x = x.at[mod_i].set(jnp.max(x_candidates))
-            return x
+        # 使用JAX的fori_loop优化X坐标计算（替代Python循环）
+        def compute_x_step(i, x):
+            mod_i = s1[i]
+            # 模块j在mod_i左边当且仅当：
+            # j在s1和s2中都出现在mod_i之前
+            mask = (pos1 < pos1[mod_i]) & (pos2 < pos2[mod_i])
+            # x[mod_i]必须至少是x[j] + width[j]对于所有在左边的j
+            x_candidates = jnp.where(mask, x + widths, 0.0)
+            return x.at[mod_i].set(jnp.max(x_candidates))
         
-        # 使用向量化操作优化Y坐标计算
-        def compute_y_coordinates():
-            y = jnp.zeros(N, dtype=jnp.float32)
-            for i in range(N):
-                mod_i = s2[i]
-                # 模块j在mod_i下面当且仅当：
-                # j在s1中出现在mod_i之前但在s2中出现在mod_i之后
-                mask = (pos2 < pos2[mod_i]) & (pos1 > pos1[mod_i])
-                y_candidates = jnp.where(mask, y + heights, 0.0)
-                y = y.at[mod_i].set(jnp.max(y_candidates))
-            return y
+        # 使用JAX的fori_loop优化Y坐标计算（替代Python循环）
+        def compute_y_step(i, y):
+            mod_i = s2[i]
+            # 模块j在mod_i下面当且仅当：
+            # j在s1中出现在mod_i之前但在s2中出现在mod_i之后
+            mask = (pos2 < pos2[mod_i]) & (pos1 > pos1[mod_i])
+            y_candidates = jnp.where(mask, y + heights, 0.0)
+            return y.at[mod_i].set(jnp.max(y_candidates))
         
-        x = compute_x_coordinates()
-        y = compute_y_coordinates()
+        x = jax.lax.fori_loop(0, N, compute_x_step, jnp.zeros(N, dtype=jnp.float32))
+        y = jax.lax.fori_loop(0, N, compute_y_step, jnp.zeros(N, dtype=jnp.float32))
         
         return x, y
