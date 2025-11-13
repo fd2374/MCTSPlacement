@@ -61,6 +61,7 @@ class PlacementRunner:
         ordered_modules = self.movable_indices[sorted_order]
         return jnp.array(ordered_modules)
     
+    functools.partial(jax.jit, static_argnums=(0,))
     def run_mcts(self) -> tuple:
         """运行MCTS算法
         
@@ -246,9 +247,13 @@ def main():
     # 加载基准测试
     runner.load_benchmark()
     
-    # 运行MCTS
+    # with jax.profiler.trace("./tmp/jax-mcts-trace", create_perfetto_link=True):
+        # 运行MCTS
+    import time
+    start_time = time.time()
     policy_output, best_state, placer = runner.run_mcts()
-    
+    end_time = time.time()
+    print(f"MCTS运行时间: {end_time - start_time}秒")
     # 可视化结果
     runner.visualize_results(policy_output, best_state)
     

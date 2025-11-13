@@ -1,0 +1,25 @@
+# 自动检测文本文件并规范化换行符
+* text=auto
+
+# Python文件强制使用LF
+*.py text eol=lf
+
+# Markdown文件使用LF
+*.md text eol=lf
+
+# Shell脚本使用LF
+*.sh text eol=lf
+
+# 数据文件使用LF
+*.blocks text eol=lf
+*.nets text eol=lf
+*.pl text eol=lf
+
+# 二进制文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.gz binary
+*.pb binary
+
