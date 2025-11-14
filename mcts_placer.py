@@ -83,8 +83,8 @@ class MCTSPlacer:
             hpwl = self.placement_solver.compute_hpwl(
                 state.s1, state.s2, state.orientations
             )
-            return -hpwl  # 负值因为我们想要最小化
-        
+            return -hpwl  # 负值因为我们想要最小化pygraphviz
+            
         reward = jax.lax.cond(
             is_terminal,
             terminal_reward,

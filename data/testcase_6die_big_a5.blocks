@@ -1,0 +1,10 @@
+NumSoftRectangularBlocks : 0
+NumHardRectilinearBlocks : 6
+NumTerminals : 0
+
+die1 hardrectilinear 4 (0, 0) (0, 15919) (3874, 15919) (3874, 0)
+die2 hardrectilinear 4 (0, 0) (0, 15919) (14439, 15919) (14439, 0)
+die3 hardrectilinear 4 (0, 0) (0, 15919) (7261, 15919) (7261, 0)
+die4 hardrectilinear 4 (0, 0) (0, 9820) (3874, 9820) (3874, 0)
+die5 hardrectilinear 4 (0, 0) (0, 9820) (14439, 9820) (14439, 0)
+die6 hardrectilinear 4 (0, 0) (0, 9820) (7261, 9820) (7261, 0)
