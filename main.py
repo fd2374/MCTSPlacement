@@ -201,7 +201,8 @@ class PlacementRunner:
             jnp.array(pins_dx),
             jnp.array(pins_dy),
             self.movable_indices,
-            f"{self.config.output_dir}/best_placement.png"
+            f"{self.config.output_dir}/best_placement.png",
+            draw_connections=True
         )
         
         print(f"最佳布局图已保存到: {self.config.output_dir}/best_placement.png")
