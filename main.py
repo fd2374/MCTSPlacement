@@ -118,45 +118,41 @@ class PlacementRunner:
         return policy_output, best_terminal_state, placer
     
     def _extract_best_terminal_state(self, search_tree, placer):
-        """从搜索树中提取奖励最高的终端状态"""
-        # 遍历搜索树找到所有终端节点
-        best_reward = float('-inf')
-        best_state = None
-        
-        # 获取搜索树信息
+        """从搜索树中提取奖励最高的终端状态（向量化版本，避免GPU-CPU同步）"""
         tree = search_tree
-        num_nodes = tree.num_simulations
+        target_step = 3 * self.num_movable
         
-        # 遍历所有节点，寻找终端状态
-        for batch_idx in range(self.config.batch_size):
-            for node_idx in range(num_nodes):
-                # 检查是否为终端节点（没有子节点或访问次数为0）
-                if tree.embeddings.step[batch_idx, node_idx] != 3 * self.num_movable:
-                    continue
-                    
-                # 获取节点值作为奖励
-                node_reward = float(tree.node_values[batch_idx, node_idx])
-                
-                # 如果这个节点的奖励更高，记录它
-                if node_reward > best_reward:
-                    best_reward = node_reward
-                    # 这里我们需要从节点索引重构状态
-                    # 由于MCTS树结构复杂，我们使用一个简化的方法
-                    # 实际应用中可能需要更复杂的状态重构逻辑
-                    best_state = PlacementState(
-                        s1=tree.embeddings.s1[batch_idx, node_idx],
-                        s2=tree.embeddings.s2[batch_idx, node_idx],
-                        orientations=tree.embeddings.orientations[batch_idx, node_idx],
-                        step=tree.embeddings.step[batch_idx, node_idx]
-                    )
+        # 在 GPU 上一次性完成所有计算
+        # 1. 找到所有终端节点的掩码 (batch_size, num_nodes)
+        terminal_mask = tree.embeddings.step == target_step
         
-        # 如果没有找到终端状态，使用默认状态
-        if best_state is None:
+        # 2. 获取所有节点的值，非终端节点设为 -inf
+        masked_values = jnp.where(terminal_mask, tree.node_values, -jnp.inf)
+        
+        # 3. 展平并找到最大值的索引
+        flat_values = masked_values.reshape(-1)
+        best_flat_idx = int(jnp.argmax(flat_values))  # 转换为 Python int
+        best_value = float(flat_values[best_flat_idx])
+        
+        # 4. 检查是否找到有效的终端状态
+        if best_value == float('-inf'):
             print("Warning: No terminal states found, using default state")
-            best_state = placer.state_manager.create_initial_state(self.num_movable)
-            best_reward = 0.0
-            
-        return best_state, -best_reward
+            return placer.state_manager.create_initial_state(self.num_movable), 0.0
+        
+        # 5. 计算 batch_idx 和 node_idx（使用实际的数组形状）
+        num_nodes = tree.node_values.shape[1]  # 使用实际的节点数，而不是 num_simulations
+        batch_idx = best_flat_idx // num_nodes
+        node_idx = best_flat_idx % num_nodes
+        
+        # 6. 提取最佳状态的数据（使用 Python int 索引）
+        best_state = PlacementState(
+            s1=tree.embeddings.s1[batch_idx, node_idx],
+            s2=tree.embeddings.s2[batch_idx, node_idx],
+            orientations=tree.embeddings.orientations[batch_idx, node_idx],
+            step=tree.embeddings.step[batch_idx, node_idx]
+        )
+        
+        return best_state, -best_value
     
     def visualize_results(self, policy_output, best_state) -> None:
         """可视化结果"""

@@ -1,0 +1,8 @@
+jax
+mctx
+numpy
+matplotlib
+seaborn
+pygraphviz
+chex
+tqdm
