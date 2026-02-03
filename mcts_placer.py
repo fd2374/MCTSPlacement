@@ -40,7 +40,7 @@ class MCTSPlacer:
     def root_fn(self, state: PlacementState, max_actions: int, rng_key) -> mctx.RootFnOutput:
         """MCTS根函数"""
         return mctx.RootFnOutput(
-            prior_logits=jnp.zeros(max_actions, dtype=jnp.float32),
+            prior_logits=self.policy_function(state),  # 使用有效动作掩码
             value=jnp.array(0.0, dtype=jnp.float32),
             embedding=state
         )
