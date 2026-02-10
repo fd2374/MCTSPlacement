@@ -26,6 +26,10 @@ class PlacementConfig:
     # 算法参数
     gumbel_scale: float = 1.0
     
+    # Interposer边界（None表示从terminal自动计算）
+    boundary_width: Optional[float] = None
+    boundary_height: Optional[float] = None
+    
     def validate(self) -> None:
         """验证配置参数"""
         if self.num_simulations <= 0:
