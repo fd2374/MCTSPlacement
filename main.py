@@ -140,11 +140,17 @@ class PlacementRunner:
         return float(jnp.max(tx + tw)), float(jnp.max(ty + th))
     
     def post_optimize(self, x, y, w, h, pins_dx, pins_dy):
-        """后处理优化"""
+        """后处理优化（参数从config读取）"""
         optimizer = PostOptimizer(self.bench, self.movable_indices)
         return optimizer.optimize_with_annealing(
             x, y, w, h, pins_dx, pins_dy,
-            boundary_width=self.boundary_width, boundary_height=self.boundary_height
+            boundary_width=self.boundary_width,
+            boundary_height=self.boundary_height,
+            max_iterations=self.config.annealing_phases,
+            initial_step=self.config.initial_step,
+            final_step=self.config.final_step,
+            initial_search_points=self.config.initial_search_points,
+            final_search_points=self.config.final_search_points,
         )
     
     def plot(self, x, y, w, h, pins_dx, pins_dy, filename, title=None):
@@ -170,33 +176,45 @@ class PlacementRunner:
 
 
 def create_config_from_args() -> PlacementConfig:
-    """从命令行参数创建配置"""
-    parser = argparse.ArgumentParser(description='重构的MCTS序列对布局器（终端奖励 = -HPWL）')
-    parser.add_argument('--base-path', default="./data/apte", help='基础路径（会自动添加.blocks, .nets, .pl后缀）')
-    parser.add_argument('--sims', type=int, default=100, help='MCTS模拟次数')
-    parser.add_argument('--seed', type=int, default=0, help='随机种子')
-    parser.add_argument('--batch', type=int, default=1, help='并行根节点的批处理大小')
-    parser.add_argument('--output', default=".", help='输出目录')
-    parser.add_argument('--gumbel-scale', type=float, default=1.0, help='Gumbel缩放因子')
-    parser.add_argument('--width', type=float, default=None, help='Interposer宽度（不指定则从terminal自动计算）')
-    parser.add_argument('--height', type=float, default=None, help='Interposer高度（不指定则从terminal自动计算）')
+    """从YAML配置文件 + 命令行参数创建配置
+    
+    优先级：命令行参数 > YAML文件 > 默认值
+    """
+    parser = argparse.ArgumentParser(description='MCTS序列对布局器')
+    
+    # 配置文件
+    parser.add_argument('-c', '--config', type=str, default=None,
+                        help='YAML配置文件路径（命令行参数可覆盖）')
+    
+    # 所有参数默认None，只有显式指定时才覆盖YAML
+    parser.add_argument('--base-path', default=None, help='数据路径')
+    parser.add_argument('--sims', type=int, default=None, help='MCTS模拟次数')
+    parser.add_argument('--seed', type=int, default=None, help='随机种子')
+    parser.add_argument('--batch', type=int, default=None, help='批处理大小')
+    parser.add_argument('--output', default=None, help='输出目录')
+    parser.add_argument('--gumbel-scale', type=float, default=None, help='Gumbel缩放因子')
+    parser.add_argument('--width', type=float, default=None, help='Interposer宽度')
+    parser.add_argument('--height', type=float, default=None, help='Interposer高度')
+    parser.add_argument('--initial-step', type=float, default=None, help='后处理初始步长')
+    parser.add_argument('--final-step', type=float, default=None, help='后处理最终步长')
+    parser.add_argument('--initial-search-points', type=int, default=None, help='初始搜索点数')
+    parser.add_argument('--final-search-points', type=int, default=None, help='最终搜索点数')
+    parser.add_argument('--annealing-phases', type=int, default=None, help='退火阶段数')
     parser.add_argument('--no-tree', action='store_true', help='不保存搜索树图')
     parser.add_argument('--no-viz', action='store_true', help='不保存可视化')
-
+    
     args = parser.parse_args()
     
-    config = PlacementConfig(
-        base_path=args.base_path,
-        num_simulations=args.sims,
-        seed=args.seed,
-        batch_size=args.batch,
-        output_dir=args.output,
-        gumbel_scale=args.gumbel_scale,
-        boundary_width=args.width,
-        boundary_height=args.height,
-        save_tree=not args.no_tree,
-        save_visualization=not args.no_viz
-    )
+    # 1. 从YAML加载 或 使用默认值
+    if args.config:
+        config = PlacementConfig.from_yaml(args.config)
+        print(f"已加载配置文件: {args.config}")
+    else:
+        config = PlacementConfig()
+    
+    # 2. 命令行参数覆盖（只覆盖显式指定的）
+    cli = {k.replace('-', '_'): v for k, v in vars(args).items() if k != 'config'}
+    config.merge_cli(cli)
     
     config.validate()
     return config
