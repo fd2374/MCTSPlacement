@@ -149,8 +149,7 @@ class PlacementRunner:
             max_iterations=self.config.annealing_phases,
             initial_step=self.config.initial_step,
             final_step=self.config.final_step,
-            initial_search_points=self.config.initial_search_points,
-            final_search_points=self.config.final_search_points,
+            search_points=self.config.search_points,
         )
     
     def plot(self, x, y, w, h, pins_dx, pins_dy, filename, title=None):
@@ -197,8 +196,7 @@ def create_config_from_args() -> PlacementConfig:
     parser.add_argument('--height', type=float, default=None, help='Interposer高度')
     parser.add_argument('--initial-step', type=float, default=None, help='后处理初始步长')
     parser.add_argument('--final-step', type=float, default=None, help='后处理最终步长')
-    parser.add_argument('--initial-search-points', type=int, default=None, help='初始搜索点数')
-    parser.add_argument('--final-search-points', type=int, default=None, help='最终搜索点数')
+    parser.add_argument('--search-points', type=int, default=None, help='搜索点数')
     parser.add_argument('--annealing-phases', type=int, default=None, help='退火阶段数')
     parser.add_argument('--no-tree', action='store_true', help='不保存搜索树图')
     parser.add_argument('--no-viz', action='store_true', help='不保存可视化')

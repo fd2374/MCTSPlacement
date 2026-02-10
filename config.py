@@ -30,8 +30,7 @@ class PlacementConfig:
     # 后处理优化参数
     initial_step: float = 10.0
     final_step: float = 1.0
-    initial_search_points: int = 20
-    final_search_points: int = 5
+    search_points: int = 20
     annealing_phases: int = 5
     
     # 输出配置

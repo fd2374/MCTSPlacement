@@ -309,8 +309,12 @@ class PostOptimizer:
                                 boundary_width=None, boundary_height=None,
                                 max_iterations=5,
                                 initial_step=10, final_step=1,
-                                initial_search_points=20, final_search_points=5):
-        """退火策略后处理优化"""
+                                search_points=20):
+        """退火策略后处理优化
+        
+        search_points 固定不变，只有步长随退火缩小。
+        数组形状全程不变 → JIT只编译一次。
+        """
         print("\n" + "="*50)
         print("后处理优化（退火策略）")
         print("="*50)
@@ -331,19 +335,20 @@ class PostOptimizer:
             self.nets_ptr, self.pins_nodes, pins_dx, pins_dy
         ))
         
+        print(f"搜索点数={search_points} (固定), "
+              f"候选数={(2*search_points+1)**2 - 1}")
+        
         for phase in range(max_iterations):
             t = phase / max(1, max_iterations - 1)
-            cur_points = int(initial_search_points * (1 - t) + final_search_points * t)
             cur_step = initial_step * (1 - t) + final_step * t
             
-            print(f"\n阶段 {phase + 1}/{max_iterations}: "
-                  f"搜索点数={cur_points}, 步长={cur_step:.2f}")
+            print(f"\n阶段 {phase + 1}/{max_iterations}: 步长={cur_step:.2f}")
             
             opt_x, opt_y, hpwl = self.optimize(
                 opt_x, opt_y, widths, heights, pins_dx, pins_dy,
                 boundary_width, boundary_height,
                 max_iterations=3, search_step=cur_step,
-                num_search_points=cur_points
+                num_search_points=search_points
             )
         
         return opt_x, opt_y, hpwl
