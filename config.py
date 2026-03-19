@@ -37,6 +37,8 @@ class PlacementConfig:
     output_dir: str = "."
     save_visualization: bool = True
     save_tree: bool = True
+    use_nn: bool = False
+    nn_weights: Optional[str] = None
     
     # YAML键名 -> dataclass字段名 映射
     _KEY_MAP = {

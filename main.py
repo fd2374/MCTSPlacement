@@ -16,6 +16,7 @@ from mcts_placer import MCTSPlacer
 from visualizer import PlacementVisualizer
 from config import PlacementConfig
 from post_optimizer import PostOptimizer
+from nn_model import init_params as nn_init_params, load_params as nn_load_params
 
 
 class PlacementRunner:
@@ -58,29 +59,42 @@ class PlacementRunner:
         print(f"网络数: {len(self.bench.nets_ptr) - 1}")
         print(f"Interposer边界: {self.boundary_width:.2f} x {self.boundary_height:.2f}")
     
-    def run_mcts(self) -> tuple:
+    def run_mcts(self, use_nn: bool = False) -> tuple:
         """运行MCTS算法"""
-        print(f"\n运行MCTS，{self.config.num_simulations}次模拟...")
+        print(f"\n运行MCTS，{self.config.num_simulations}次模拟"
+              f"{'（神经网络模式）' if use_nn else ''}...")
         
-        # 按面积排序模块（降序）
         areas = self.bench.widths[self.movable_indices] * self.bench.heights[self.movable_indices]
         ordered_modules = self.movable_indices[jnp.argsort(-areas)]
         
-        # 创建MCTS布局器
-        self.placer = MCTSPlacer(self.bench, jnp.array(self.movable_indices), ordered_modules)
+        self.placer = MCTSPlacer(
+            self.bench, jnp.array(self.movable_indices), ordered_modules,
+            use_nn=use_nn,
+            boundary_width=self.boundary_width,
+            boundary_height=self.boundary_height,
+        )
         
-        # 运行MCTS
         rng_key = jax.random.PRNGKey(self.config.seed)
-        rng_key, subkey = jax.random.split(rng_key)
+        rng_key, subkey, nn_key = jax.random.split(rng_key, 3)
+        
+        if use_nn and self.config.nn_weights:
+            nn_params = nn_load_params(self.config.nn_weights)
+            print(f"  已加载网络权重: {self.config.nn_weights}")
+        elif use_nn:
+            nn_params = nn_init_params(self.num_movable, nn_key)
+            print(f"  使用随机初始化网络权重")
+        else:
+            nn_params = None
         
         initial_state = StateManager.create_initial_state(self.num_movable)
         recurrent_fn = jax.vmap(self.placer.create_recurrent_fn(), (None, None, 0, 0))
-        root = jax.vmap(self.placer.root_fn, (None, None, 0))(
-            initial_state, self.placer.max_actions, jax.random.split(subkey, self.config.batch_size)
+        root = jax.vmap(self.placer.root_fn, (None, None, None, 0))(
+            nn_params, initial_state, self.placer.max_actions,
+            jax.random.split(subkey, self.config.batch_size)
         )
         
         policy_output = mctx.gumbel_muzero_policy(
-            params=None,
+            params=nn_params,
             rng_key=rng_key,
             root=root,
             recurrent_fn=recurrent_fn,
@@ -90,7 +104,6 @@ class PlacementRunner:
             qtransform=functools.partial(mctx.qtransform_completed_by_mix_value)
         )
         
-        # 提取最佳终端状态
         best_state, best_reward = self._extract_best_terminal_state(policy_output.search_tree)
         
         print(f"  最佳奖励: {float(best_reward):.2f}")
@@ -231,6 +244,8 @@ def create_config_from_args() -> PlacementConfig:
     parser.add_argument('--annealing-phases', type=int, default=None, help='退火阶段数')
     parser.add_argument('--no-tree', action='store_true', help='不保存搜索树图')
     parser.add_argument('--no-viz', action='store_true', help='不保存可视化')
+    parser.add_argument('--use-nn', action='store_true', help='使用神经网络替代rollout')
+    parser.add_argument('--nn-weights', type=str, default=None, help='训练好的网络权重路径(JSON)')
     
     args = parser.parse_args()
     
@@ -262,7 +277,7 @@ def main():
     
     # 运行MCTS
     start = time.time()
-    policy_output, best_state = runner.run_mcts()
+    policy_output, best_state = runner.run_mcts(use_nn=config.use_nn)
     print(f"MCTS运行时间: {time.time() - start:.2f}秒")
     
     runner.save_tree(policy_output)
@@ -285,7 +300,7 @@ def main():
     
     for i in range(k):
         mcts_hpwl = float(top_mcts_hpwls[i])
-        if mcts_hpwl <= 0 or mcts_hpwl == float('inf'):
+        if jnp.isinf(top_mcts_hpwls[i]) or jnp.isnan(top_mcts_hpwls[i]):
             continue
         
         state_i = PlacementState(
@@ -304,7 +319,12 @@ def main():
     
     print(f"后处理优化时间: {time.time() - start:.2f}秒")
     
-    # 画最终最优结果
+    if best_result is None:
+        print("警告: 没有有效候选，使用全局最佳 MCTS 结果进行后处理")
+        x, y, w, h, pins_dx, pins_dy = runner.get_coords(best_state)
+        opt_x, opt_y, hpwl = runner.post_optimize(x, y, w, h, pins_dx, pins_dy)
+        best_result = (opt_x, opt_y, w, h, pins_dx, pins_dy)
+    
     opt_x, opt_y, w, h, pins_dx, pins_dy = best_result
     runner.plot(opt_x, opt_y, w, h, pins_dx, pins_dy, "best_placement.png", "优化后")
     
