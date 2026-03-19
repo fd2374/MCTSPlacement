@@ -185,6 +185,34 @@ class PostOptimizer:
         
         return final_x, final_y, improved
     
+    @staticmethod
+    @jax.jit
+    def _sweep_modules(opt_x, opt_y, widths, heights,
+                       movable_indices, offsets_x, offsets_y,
+                       bw, bh, nets_ptr, pins_nodes, pins_dx, pins_dy):
+        """一轮完整的模块扫描优化（全部在GPU上，无Python循环开销）
+        
+        用 lax.fori_loop 替代 Python for 循环，将整个模块遍历编译为
+        单个 XLA 计算图，消除逐模块的 kernel launch 和 CPU-GPU 同步。
+        """
+        n = movable_indices.shape[0]
+        
+        def body(i, carry):
+            ox, oy = carry
+            idx = movable_indices[i]
+            bx, by, _ = PostOptimizer._batch_find_best(
+                ox, oy, widths, heights,
+                idx, ox[idx] + offsets_x, oy[idx] + offsets_y,
+                widths[idx], heights[idx], bw, bh,
+                movable_indices, i,
+                nets_ptr, pins_nodes, pins_dx, pins_dy
+            )
+            ox = ox.at[idx].set(bx)
+            oy = oy.at[idx].set(by)
+            return ox, oy
+        
+        return jax.lax.fori_loop(0, n, body, (opt_x, opt_y))
+    
     # ======================== 公开方法 ========================
     
     def _get_boundary_from_terminals(self) -> Tuple[float, float]:
@@ -270,18 +298,11 @@ class PostOptimizer:
         prev_hpwl = initial_hpwl
         
         for iteration in range(max_iterations):
-            for i in range(self.num_movable):
-                idx = self.movable_indices[i]
-                # 全部在GPU上：索引、加偏移、批量评估、更新
-                best_x, best_y, _ = self._batch_find_best(
-                    opt_x, opt_y, widths, heights,
-                    idx, opt_x[idx] + offsets_x, opt_y[idx] + offsets_y,
-                    widths[idx], heights[idx], bw, bh,
-                    self.movable_indices, jnp.int32(i),
-                    self.nets_ptr, self.pins_nodes, pins_dx, pins_dy
-                )
-                opt_x = opt_x.at[idx].set(best_x)
-                opt_y = opt_y.at[idx].set(best_y)
+            opt_x, opt_y = self._sweep_modules(
+                opt_x, opt_y, widths, heights,
+                self.movable_indices, offsets_x, offsets_y,
+                bw, bh, self.nets_ptr, self.pins_nodes, pins_dx, pins_dy
+            )
             
             # 每轮迭代只同步一次（打印HPWL）
             current_hpwl = float(self._compute_hpwl_direct(

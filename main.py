@@ -124,6 +124,34 @@ class PlacementRunner:
         )
         return best_state, -best_value
     
+    def _extract_top_k_states(self, tree, k):
+        """从搜索树中提取每个 batch 的最佳终端状态，返回 top-K 个（向量化，O(1) 同步）"""
+        target_step = 3 * self.num_movable
+        terminal_mask = tree.embeddings.step == target_step
+        masked_values = jnp.where(terminal_mask, tree.node_values, -jnp.inf)
+        
+        best_node_per_batch = jnp.argmax(masked_values, axis=1)
+        best_value_per_batch = jnp.max(masked_values, axis=1)
+        
+        batch_indices = jnp.arange(masked_values.shape[0])
+        all_states = PlacementState(
+            s1=tree.embeddings.s1[batch_indices, best_node_per_batch],
+            s2=tree.embeddings.s2[batch_indices, best_node_per_batch],
+            orientations=tree.embeddings.orientations[batch_indices, best_node_per_batch],
+            step=tree.embeddings.step[batch_indices, best_node_per_batch],
+        )
+        all_hpwls = -best_value_per_batch
+        
+        top_k_indices = jnp.argsort(all_hpwls)[:k]
+        top_states = PlacementState(
+            s1=all_states.s1[top_k_indices],
+            s2=all_states.s2[top_k_indices],
+            orientations=all_states.orientations[top_k_indices],
+            step=all_states.step[top_k_indices],
+        )
+        top_hpwls = all_hpwls[top_k_indices]
+        return top_states, top_hpwls, int(k)
+    
     def get_coords(self, best_state):
         """获取布局坐标"""
         return self.placer.placement_solver.compute_final_positions(
@@ -239,24 +267,46 @@ def main():
     
     runner.save_tree(policy_output)
     
-    # 获取坐标
+    # 提取 top-K 候选方案（每个 batch 的最佳终端状态）
+    top_k = min(config.batch_size, 10)
+    top_states, top_mcts_hpwls, k = runner._extract_top_k_states(
+        policy_output.search_tree, top_k
+    )
+    
+    # 显示 MCTS 最佳结果（优化前）
     x, y, w, h, pins_dx, pins_dy = runner.get_coords(best_state)
     
-    print("\n" + "="*50)
-    print("布局结果")
-    print("="*50)
-    
-    # 画优化前
-    runner.plot(x, y, w, h, pins_dx, pins_dy, "before_opt.png", "优化前")
-    
-    # 后处理优化
-    print("\n开始后处理优化...")
+    # 对所有候选方案运行后处理优化，取最优
+    print(f"\n开始后处理优化（{k} 个候选方案）...")
     start = time.time()
-    opt_x, opt_y, _ = runner.post_optimize(x, y, w, h, pins_dx, pins_dy)
+    
+    best_hpwl = float('inf')
+    best_result = None
+    
+    for i in range(k):
+        mcts_hpwl = float(top_mcts_hpwls[i])
+        if mcts_hpwl <= 0 or mcts_hpwl == float('inf'):
+            continue
+        
+        state_i = PlacementState(
+            s1=top_states.s1[i], s2=top_states.s2[i],
+            orientations=top_states.orientations[i], step=top_states.step[i],
+        )
+        xi, yi, wi, hi, pdx, pdy = runner.get_coords(state_i)
+        opt_x, opt_y, hpwl = runner.post_optimize(xi, yi, wi, hi, pdx, pdy)
+        
+        tag = ""
+        if hpwl < best_hpwl:
+            best_hpwl = hpwl
+            best_result = (opt_x, opt_y, wi, hi, pdx, pdy)
+            tag = " ← 最优"
+        print(f"  候选 {i+1}/{k}: MCTS={mcts_hpwl:.0f} → PostOpt={hpwl:.0f}{tag}")
+    
     print(f"后处理优化时间: {time.time() - start:.2f}秒")
     
-    # 画优化后
-    runner.plot(opt_x, opt_y, w, h, pins_dx, pins_dy, "after_opt.png", "优化后")
+    # 画最终最优结果
+    opt_x, opt_y, w, h, pins_dx, pins_dy = best_result
+    runner.plot(opt_x, opt_y, w, h, pins_dx, pins_dy, "best_placement.png", "优化后")
     
     print("\n" + "="*60)
     print("完成！")
