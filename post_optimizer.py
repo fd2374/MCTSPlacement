@@ -74,50 +74,6 @@ class PostOptimizer:
     
     @staticmethod
     @jax.jit
-    def _separation_step(opt_x, opt_y, widths, heights,
-                         movable_indices, boundary_w, boundary_h):
-        """一步分离操作（GPU加速）：计算推力并移动所有模块"""
-        mx, my = opt_x[movable_indices], opt_y[movable_indices]
-        mw, mh = widths[movable_indices], heights[movable_indices]
-        n = movable_indices.shape[0]
-        
-        # 两两重叠面积 (n, n)
-        ov_x = jnp.maximum(0, jnp.minimum(mx[:, None] + mw[:, None],
-                                           mx[None, :] + mw[None, :]) -
-                              jnp.maximum(mx[:, None], mx[None, :]))
-        ov_y = jnp.maximum(0, jnp.minimum(my[:, None] + mh[:, None],
-                                           my[None, :] + mh[None, :]) -
-                              jnp.maximum(my[:, None], my[None, :]))
-        overlap_area = ov_x * ov_y
-        
-        # 推力方向（从j指向i）
-        cx, cy = mx + mw / 2, my + mh / 2
-        dx = cx[:, None] - cx[None, :]
-        dy = cy[:, None] - cy[None, :]
-        dist = jnp.maximum(1e-6, jnp.sqrt(dx**2 + dy**2))
-        
-        force_mag = jnp.sqrt(overlap_area) * (~jnp.eye(n, dtype=bool))
-        force_x = jnp.sum(dx / dist * force_mag, axis=1)
-        force_y = jnp.sum(dy / dist * force_mag, axis=1)
-        
-        # 应用推力
-        fmag = jnp.maximum(1e-6, jnp.sqrt(force_x**2 + force_y**2))
-        step_size = jnp.minimum(mw, mh) * 0.3
-        should_move = fmag > 1e-6
-        
-        new_mx = mx + jnp.where(should_move, force_x / fmag * step_size, 0.0)
-        new_my = my + jnp.where(should_move, force_y / fmag * step_size, 0.0)
-        new_mx = jnp.clip(new_mx, 0, boundary_w - mw)
-        new_my = jnp.clip(new_my, 0, boundary_h - mh)
-        
-        opt_x = opt_x.at[movable_indices].set(new_mx)
-        opt_y = opt_y.at[movable_indices].set(new_my)
-        
-        total_overlap = jnp.sum(overlap_area * jnp.triu(jnp.ones((n, n)), k=1))
-        return opt_x, opt_y, jnp.any(should_move), total_overlap
-    
-    @staticmethod
-    @jax.jit
     def _batch_find_best(opt_x, opt_y, widths, heights,
                          module_idx, candidate_x, candidate_y,
                          module_w, module_h,
@@ -224,152 +180,107 @@ class PostOptimizer:
         terminal_h = jnp.where(terminal_mask, self.bench.heights, 0)
         return float(jnp.max(terminal_x + terminal_w)), float(jnp.max(terminal_y + terminal_h))
     
-    def separate_overlaps(self, x, y, widths, heights,
-                          boundary_width, boundary_height,
-                          max_iterations=50):
-        """分离重叠模块（GPU加速力导向法）"""
-        opt_x = jnp.array(x, dtype=jnp.float32)
-        opt_y = jnp.array(y, dtype=jnp.float32)
+    @staticmethod
+    @jax.jit
+    def _optimize_iterations(opt_x, opt_y, widths, heights,
+                             movable_indices, offsets_x, offsets_y,
+                             bw, bh, nets_ptr, pins_nodes, pins_dx, pins_dy,
+                             max_iterations):
+        """多轮 sweep 迭代，带早停（全部在 GPU 上，零 CPU 同步）"""
+        def compute_hpwl(ox, oy):
+            centers_x = ox + 0.5 * widths
+            centers_y = oy + 0.5 * heights
+            pw = widths[pins_nodes]
+            ph = heights[pins_nodes]
+            pin_x = centers_x[pins_nodes] + (pins_dx / 100.0) * pw
+            pin_y = centers_y[pins_nodes] + (pins_dy / 100.0) * ph
+            num_nets = nets_ptr.shape[0] - 1
+            counts = nets_ptr[1:] - nets_ptr[:-1]
+            seg_ids = jnp.repeat(jnp.arange(num_nets, dtype=jnp.int32), counts,
+                                 total_repeat_length=pins_nodes.shape[0])
+            return jnp.sum(
+                jax.ops.segment_max(pin_x, seg_ids, num_segments=num_nets) -
+                jax.ops.segment_min(pin_x, seg_ids, num_segments=num_nets) +
+                jax.ops.segment_max(pin_y, seg_ids, num_segments=num_nets) -
+                jax.ops.segment_min(pin_y, seg_ids, num_segments=num_nets))
         
-        initial_overlap = float(self._compute_total_overlap(
-            opt_x, opt_y, widths, heights, self.movable_indices))
-        if initial_overlap == 0:
-            print("  无重叠，跳过分离步骤")
-            return opt_x, opt_y
+        init_hpwl = compute_hpwl(opt_x, opt_y)
         
-        print(f"  初始重叠面积: {initial_overlap:.2f}")
-        bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
+        def cond(carry):
+            ox, oy, prev_hpwl, i, cont = carry
+            return cont & (i < max_iterations)
         
-        for iteration in range(max_iterations):
-            opt_x, opt_y, moved, overlap = self._separation_step(
-                opt_x, opt_y, widths, heights, self.movable_indices, bw, bh
-            )
-            current_overlap = float(overlap)
-            
-            if iteration % 10 == 0:
-                print(f"    分离迭代 {iteration}: 重叠面积 = {current_overlap:.2f}")
-            if current_overlap == 0:
-                print(f"  分离完成！迭代次数: {iteration + 1}")
-                break
-            if not bool(moved):
-                break
+        def body(carry):
+            ox, oy, prev_hpwl, i, _ = carry
+            ox, oy = PostOptimizer._sweep_modules(
+                ox, oy, widths, heights, movable_indices, offsets_x, offsets_y,
+                bw, bh, nets_ptr, pins_nodes, pins_dx, pins_dy)
+            cur_hpwl = compute_hpwl(ox, oy)
+            improved = cur_hpwl < prev_hpwl - 1e-6
+            return ox, oy, cur_hpwl, i + 1, improved
         
-        final_overlap = float(self._compute_total_overlap(
-            opt_x, opt_y, widths, heights, self.movable_indices))
-        print(f"  分离后重叠面积: {final_overlap:.2f}")
-        return opt_x, opt_y
+        ox, oy, final_hpwl, _, _ = jax.lax.while_loop(
+            cond, body, (opt_x, opt_y, init_hpwl, jnp.int32(0), jnp.bool_(True)))
+        return ox, oy, final_hpwl
     
-    def optimize(self, x, y, widths, heights, pins_dx, pins_dy,
-                 boundary_width=None, boundary_height=None,
-                 max_iterations=10, search_step=None, num_search_points=10):
-        """GPU加速的后处理优化
+    @staticmethod
+    @jax.jit
+    def _full_annealing(opt_x, opt_y, widths, heights,
+                        movable_indices, bw, bh,
+                        nets_ptr, pins_nodes, pins_dx, pins_dy,
+                        num_phases, iters_per_phase, initial_step, final_step,
+                        base_offsets_x, base_offsets_y):
+        """完整的退火优化流程（全部在 GPU 上，单个 kernel）
         
-        对每个模块：一次GPU调用批量评估所有候选位置的边界、重叠和HPWL。
-        原来每模块需 ~1680 次GPU调用，现在只需 1 次。
+        将退火阶段循环 + 每阶段的迭代优化全部编译进 XLA，
+        整个过程零 CPU-GPU 同步。
         """
-        if boundary_width is None or boundary_height is None:
-            boundary_width, boundary_height = self._get_boundary_from_terminals()
+        def phase_body(phase, carry):
+            ox, oy = carry
+            t = phase / jnp.maximum(1, num_phases - 1)
+            cur_step = initial_step * (1 - t) + final_step * t
+            offsets_x = base_offsets_x * cur_step
+            offsets_y = base_offsets_y * cur_step
+            ox, oy, _ = PostOptimizer._optimize_iterations(
+                ox, oy, widths, heights, movable_indices, offsets_x, offsets_y,
+                bw, bh, nets_ptr, pins_nodes, pins_dx, pins_dy, iters_per_phase)
+            return ox, oy
         
-        if search_step is None:
-            avg_size = float(jnp.mean(
-                widths[self.movable_indices] + heights[self.movable_indices]) / 2)
-            search_step = avg_size * 0.5
-        
-        opt_x = jnp.array(x, dtype=jnp.float32)
-        opt_y = jnp.array(y, dtype=jnp.float32)
-        
-        initial_hpwl = float(self._compute_hpwl_direct(
-            opt_x, opt_y, widths, heights,
-            self.nets_ptr, self.pins_nodes, pins_dx, pins_dy
-        ))
-        initial_overlap = float(self._compute_total_overlap(
-            opt_x, opt_y, widths, heights, self.movable_indices))
-        print(f"初始HPWL: {initial_hpwl:.2f}, 初始重叠面积: {initial_overlap:.2f}")
-        
-        # 预计算候选偏移（Python端，只算一次）
-        offsets = [(dx * search_step, dy * search_step)
-                   for dx in range(-num_search_points, num_search_points + 1)
-                   for dy in range(-num_search_points, num_search_points + 1)
-                   if dx != 0 or dy != 0]
-        offsets_x = jnp.array([o[0] for o in offsets], dtype=jnp.float32)
-        offsets_y = jnp.array([o[1] for o in offsets], dtype=jnp.float32)
-        
-        bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
-        prev_hpwl = initial_hpwl
-        
-        for iteration in range(max_iterations):
-            opt_x, opt_y = self._sweep_modules(
-                opt_x, opt_y, widths, heights,
-                self.movable_indices, offsets_x, offsets_y,
-                bw, bh, self.nets_ptr, self.pins_nodes, pins_dx, pins_dy
-            )
-            
-            # 每轮迭代只同步一次（打印HPWL）
-            current_hpwl = float(self._compute_hpwl_direct(
-                opt_x, opt_y, widths, heights,
-                self.nets_ptr, self.pins_nodes, pins_dx, pins_dy
-            ))
-            print(f"  迭代 {iteration + 1}: HPWL = {current_hpwl:.2f}")
-            
-            if current_hpwl >= prev_hpwl - 1e-6:
-                print(f"  无改进，停止优化")
-                break
-            prev_hpwl = current_hpwl
-        
-        final_hpwl = current_hpwl if max_iterations > 0 else initial_hpwl
-        final_overlap = float(self._compute_total_overlap(
-            opt_x, opt_y, widths, heights, self.movable_indices))
-        if final_overlap > 0:
-            print(f"警告: 最终仍有重叠! 重叠面积 = {final_overlap:.2f}")
-        
-        improvement = (initial_hpwl - final_hpwl) / initial_hpwl * 100
-        print(f"优化完成: {initial_hpwl:.2f} -> {final_hpwl:.2f} (改进 {improvement:.2f}%)")
-        return opt_x, opt_y, final_hpwl
+        opt_x, opt_y = jax.lax.fori_loop(0, num_phases, phase_body, (opt_x, opt_y))
+        return opt_x, opt_y
     
     def optimize_with_annealing(self, x, y, widths, heights, pins_dx, pins_dy,
                                 boundary_width=None, boundary_height=None,
                                 max_iterations=5,
                                 initial_step=10, final_step=1,
                                 search_points=20):
-        """退火策略后处理优化
-        
-        search_points 固定不变，只有步长随退火缩小。
-        数组形状全程不变 → JIT只编译一次。
-        """
-        print("\n" + "="*50)
-        print("后处理优化（退火策略）")
-        print("="*50)
-        
+        """退火策略后处理优化（入口函数）"""
         if boundary_width is None or boundary_height is None:
             boundary_width, boundary_height = self._get_boundary_from_terminals()
-        print(f"边界: {boundary_width:.2f} x {boundary_height:.2f}")
         
-        opt_x, opt_y = jnp.array(x, dtype=jnp.float32), jnp.array(y, dtype=jnp.float32)
+        opt_x = jnp.array(x, dtype=jnp.float32)
+        opt_y = jnp.array(y, dtype=jnp.float32)
+        bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
         
-        print("\n步骤 0: 分离重叠模块")
-        opt_x, opt_y = self.separate_overlaps(
-            opt_x, opt_y, widths, heights, boundary_width, boundary_height
-        )
+        sp = search_points
+        offsets_1d = jnp.arange(-sp, sp + 1, dtype=jnp.float32)
+        gx, gy = jnp.meshgrid(offsets_1d, offsets_1d)
+        gx, gy = gx.ravel(), gy.ravel()
+        nonzero = (gx != 0) | (gy != 0)
+        base_offsets_x = jnp.where(nonzero, gx, 0.0)
+        base_offsets_y = jnp.where(nonzero, gy, 0.0)
+        
+        opt_x, opt_y = self._full_annealing(
+            opt_x, opt_y,
+            jnp.array(widths), jnp.array(heights),
+            self.movable_indices, bw, bh,
+            self.nets_ptr, self.pins_nodes, pins_dx, pins_dy,
+            jnp.int32(max_iterations), jnp.int32(3),
+            jnp.float32(initial_step), jnp.float32(final_step),
+            base_offsets_x, base_offsets_y)
         
         hpwl = float(self._compute_hpwl_direct(
-            opt_x, opt_y, widths, heights,
-            self.nets_ptr, self.pins_nodes, pins_dx, pins_dy
-        ))
-        
-        print(f"搜索点数={search_points} (固定), "
-              f"候选数={(2*search_points+1)**2 - 1}")
-        
-        for phase in range(max_iterations):
-            t = phase / max(1, max_iterations - 1)
-            cur_step = initial_step * (1 - t) + final_step * t
-            
-            print(f"\n阶段 {phase + 1}/{max_iterations}: 步长={cur_step:.2f}")
-            
-            opt_x, opt_y, hpwl = self.optimize(
-                opt_x, opt_y, widths, heights, pins_dx, pins_dy,
-                boundary_width, boundary_height,
-                max_iterations=3, search_step=cur_step,
-                num_search_points=search_points
-            )
+            opt_x, opt_y, jnp.array(widths), jnp.array(heights),
+            self.nets_ptr, self.pins_nodes, pins_dx, pins_dy))
         
         return opt_x, opt_y, hpwl

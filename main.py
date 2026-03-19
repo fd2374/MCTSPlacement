@@ -268,7 +268,7 @@ def main():
     runner.save_tree(policy_output)
     
     # 提取 top-K 候选方案（每个 batch 的最佳终端状态）
-    top_k = min(config.batch_size, 10)
+    top_k = min(config.batch_size, 1000)
     top_states, top_mcts_hpwls, k = runner._extract_top_k_states(
         policy_output.search_tree, top_k
     )
