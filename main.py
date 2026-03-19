@@ -153,16 +153,19 @@ class PlacementRunner:
         )
     
     def plot(self, x, y, w, h, pins_dx, pins_dy, filename, title=None):
-        """绘制布局图"""
+        """绘制布局图（受 --no-viz 控制）"""
         hpwl = float(PostOptimizer._compute_hpwl_direct(
             x, y, w, h, self.bench.nets_ptr, self.bench.pins_nodes, pins_dx, pins_dy
         ))
-        path = f"{self.config.output_dir}/{filename}"
-        PlacementVisualizer.plot_placement(
-            self.bench, jnp.array(x), jnp.array(y), jnp.array(w), jnp.array(h),
-            jnp.array(pins_dx), jnp.array(pins_dy), self.movable_indices, path, draw_connections=True
-        )
-        print(f"  {title or filename}: HPWL={hpwl:.2f} -> {path}")
+        if self.config.save_visualization:
+            path = f"{self.config.output_dir}/{filename}"
+            PlacementVisualizer.plot_placement(
+                self.bench, jnp.array(x), jnp.array(y), jnp.array(w), jnp.array(h),
+                jnp.array(pins_dx), jnp.array(pins_dy), self.movable_indices, path, draw_connections=True
+            )
+            print(f"  {title or filename}: HPWL={hpwl:.2f} -> {path}")
+        else:
+            print(f"  {title or filename}: HPWL={hpwl:.2f}")
         return hpwl
     
     def save_tree(self, policy_output):
