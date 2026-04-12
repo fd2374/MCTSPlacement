@@ -89,13 +89,23 @@ class PlacementSolver:
         w_final = jnp.where(should_swap, h, w)
         h_final = jnp.where(should_swap, w, h)
         
-        # 对于每个引脚，根据其所属模块的方向决定是否翻转偏移量
+        # 根据方向旋转引脚百分比偏移
+        # N(0°): (dx,dy)→(dx,dy)  E(90°CCW): (dx,dy)→(-dy,dx)
+        # S(180°): (dx,dy)→(-dx,-dy)  W(270°CCW): (dx,dy)→(dy,-dx)
         pin_orientations = orientations[self.bench.pins_nodes]
-        should_swap_pins_dx = (pin_orientations == 2) | (pin_orientations == 3)
-        should_swap_pins_dy = (pin_orientations == 1) | (pin_orientations == 2)
+        is_E = pin_orientations == 1
+        is_S = pin_orientations == 2
+        is_W = pin_orientations == 3
         
-        pins_dx = jnp.where(should_swap_pins_dx, -self.bench.pins_dx, self.bench.pins_dx)
-        pins_dy = jnp.where(should_swap_pins_dy, self.bench.pins_dy, -self.bench.pins_dy)
+        base_dx = self.bench.pins_dx
+        base_dy = self.bench.pins_dy
+        
+        pins_dx = jnp.where(is_E, -base_dy,
+                  jnp.where(is_S, -base_dx,
+                  jnp.where(is_W, base_dy, base_dx)))
+        pins_dy = jnp.where(is_E, base_dx,
+                  jnp.where(is_S, -base_dy,
+                  jnp.where(is_W, -base_dx, base_dy)))
         
         return w_final, h_final, pins_dx, pins_dy
     
