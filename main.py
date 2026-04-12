@@ -63,8 +63,7 @@ class PlacementRunner:
         print(f"\n运行MCTS，{self.config.num_simulations}次模拟...")
         
         # 按面积排序模块（降序）
-        areas = self.bench.widths[self.movable_indices] * self.bench.heights[self.movable_indices]
-        ordered_modules = self.movable_indices[jnp.argsort(-areas)]
+        ordered_modules = jax.random.permutation(jax.random.PRNGKey(self.config.seed), self.movable_indices)
         
         # 创建MCTS布局器
         self.placer = MCTSPlacer(self.bench, jnp.array(self.movable_indices), ordered_modules)
