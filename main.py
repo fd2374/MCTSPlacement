@@ -262,19 +262,45 @@ def main():
     
     runner.save_tree(policy_output)
     
-    # 提取 top-K 候选方案（每个 batch 的最佳终端状态）
-    top_k = config.batch_size // 5 + 1
-    top_states, top_mcts_hpwls, k = runner._extract_top_k_states(
-        policy_output.search_tree, top_k
+    # 提取所有 batch 的最佳终端状态，计算坐标，过滤超出边界的解
+    all_states, all_mcts_hpwls, total = runner._extract_top_k_states(
+        policy_output.search_tree, config.batch_size
     )
-    
-    # 对所有候选方案批量后处理优化
-    print(f"\n开始后处理优化（{k} 个候选方案，GPU 并行）...")
-    start = time.time()
 
     all_x, all_y, all_w, all_h, all_pdx, all_pdy = jax.vmap(
         lambda s1, s2, ori: runner.placer.placement_solver.compute_final_positions(s1, s2, ori)
-    )(top_states.s1, top_states.s2, top_states.orientations)
+    )(all_states.s1, all_states.s2, all_states.orientations)
+
+    mi = jnp.array(runner.movable_indices)
+    in_bounds = (
+        jnp.all(all_x[:, mi] >= 0, axis=1) &
+        jnp.all(all_y[:, mi] >= 0, axis=1) &
+        jnp.all(all_x[:, mi] + all_w[:, mi] <= runner.boundary_width, axis=1) &
+        jnp.all(all_y[:, mi] + all_h[:, mi] <= runner.boundary_height, axis=1)
+    )
+    valid_mask = in_bounds & (all_mcts_hpwls > 0) & (all_mcts_hpwls < jnp.inf)
+    num_valid = int(jnp.sum(valid_mask))
+    num_oob = total - num_valid
+    print(f"  有效解: {num_valid}/{total}（删除 {num_oob} 个超出边界/无效解）")
+
+    sorted_hpwls = jnp.where(valid_mask, all_mcts_hpwls, jnp.inf)
+    top_k = min(config.batch_size // 5 + 1, num_valid)
+    top_indices = jnp.argsort(sorted_hpwls)[:top_k]
+
+    all_x, all_y = all_x[top_indices], all_y[top_indices]
+    all_w, all_h = all_w[top_indices], all_h[top_indices]
+    all_pdx, all_pdy = all_pdx[top_indices], all_pdy[top_indices]
+    top_mcts_hpwls = all_mcts_hpwls[top_indices]
+    k = top_k
+
+    # 保留 MCTS 原始坐标用于最终对比可视化
+    mcts_raw_x, mcts_raw_y = all_x.copy(), all_y.copy()
+    mcts_raw_w, mcts_raw_h = all_w.copy(), all_h.copy()
+    mcts_raw_pdx, mcts_raw_pdy = all_pdx.copy(), all_pdy.copy()
+
+    # Phase 1: 批量后处理位置优化
+    print(f"\n开始后处理优化（{k} 个候选方案，GPU 并行）...")
+    start = time.time()
 
     optimizer = PostOptimizer(runner.bench, runner.movable_indices)
     all_opt_x, all_opt_y, all_hpwls = optimizer.optimize_batch(
@@ -286,14 +312,11 @@ def main():
 
     print(f"后处理优化时间: {time.time() - start:.2f}秒")
 
-    # 按 MCTS HPWL 从小到大逐个显示，tracking running best
     print(f"\n候选结果（按 MCTS HPWL 升序）:")
     running_best_hpwl = float('inf')
     running_best_idx = -1
     for i in range(k):
         mcts_h = float(top_mcts_hpwls[i])
-        if mcts_h <= 0 or mcts_h == float('inf'):
-            continue
         opt_h = float(all_hpwls[i])
         if opt_h < running_best_hpwl:
             running_best_hpwl = opt_h
@@ -335,18 +358,32 @@ def main():
         else:
             print(f"  方向优化 {i+1}/{top10_count}: PostOpt={before_h:.0f} → OriOpt={after_h:.0f}")
 
-    # 选全局最优：位置优化 vs 方向优化
+    # 选全局最优 & 画出各阶段的图
     if ori_best_hpwl < running_best_hpwl:
-        opt_x, opt_y = ori_x[ori_best_idx], ori_y[ori_best_idx]
-        w, h = ori_w[ori_best_idx], ori_h[ori_best_idx]
-        pins_dx, pins_dy = ori_pdx[ori_best_idx], ori_pdy[ori_best_idx]
+        trace_idx = int(top10_indices[ori_best_idx])
         print(f"\n方向优化改善: {running_best_hpwl:.0f} → {ori_best_hpwl:.0f}")
-    else:
-        opt_x, opt_y = all_opt_x[best_idx], all_opt_y[best_idx]
-        w, h = all_w[best_idx], all_h[best_idx]
-        pins_dx, pins_dy = all_pdx[best_idx], all_pdy[best_idx]
 
-    runner.plot(opt_x, opt_y, w, h, pins_dx, pins_dy, "best_placement.png", "优化后")
+        runner.plot(mcts_raw_x[trace_idx], mcts_raw_y[trace_idx],
+                    mcts_raw_w[trace_idx], mcts_raw_h[trace_idx],
+                    mcts_raw_pdx[trace_idx], mcts_raw_pdy[trace_idx],
+                    "stage1_mcts.png", "Stage 1: MCTS")
+        runner.plot(all_opt_x[trace_idx], all_opt_y[trace_idx],
+                    all_w[trace_idx], all_h[trace_idx],
+                    all_pdx[trace_idx], all_pdy[trace_idx],
+                    "stage2_postopt.png", "Stage 2: PostOpt")
+        runner.plot(ori_x[ori_best_idx], ori_y[ori_best_idx],
+                    ori_w[ori_best_idx], ori_h[ori_best_idx],
+                    ori_pdx[ori_best_idx], ori_pdy[ori_best_idx],
+                    "stage3_oriopt.png", "Stage 3: OriOpt (Final)")
+    else:
+        runner.plot(mcts_raw_x[best_idx], mcts_raw_y[best_idx],
+                    mcts_raw_w[best_idx], mcts_raw_h[best_idx],
+                    mcts_raw_pdx[best_idx], mcts_raw_pdy[best_idx],
+                    "stage1_mcts.png", "Stage 1: MCTS")
+        runner.plot(all_opt_x[best_idx], all_opt_y[best_idx],
+                    all_w[best_idx], all_h[best_idx],
+                    all_pdx[best_idx], all_pdy[best_idx],
+                    "stage2_postopt.png", "Stage 2: PostOpt (Final)")
 
     print("\n" + "="*60)
     print("完成！")

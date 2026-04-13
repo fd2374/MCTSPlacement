@@ -40,8 +40,8 @@ class PlacementConfig:
     _KEY_MAP = {
         'sims': 'num_simulations',
         'batch': 'batch_size',
-        'width': 'boundary_width',
-        'height': 'boundary_height',
+        'width': 'boundary_height',
+        'height': 'boundary_width',
         'output': 'output_dir',
     }
     
