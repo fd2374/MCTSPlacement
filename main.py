@@ -96,7 +96,7 @@ class PlacementRunner:
         print(f"  s1={best_state.s1}, s2={best_state.s2}")
         print(f"  orientations={best_state.orientations}")
         
-        return policy_output, best_state
+        return policy_output
     
     def _extract_best_terminal_state(self, tree):
         """从搜索树中提取最佳终端状态"""
@@ -151,12 +151,6 @@ class PlacementRunner:
         top_hpwls = all_hpwls[top_k_indices]
         return top_states, top_hpwls, int(k)
     
-    def get_coords(self, best_state):
-        """获取布局坐标"""
-        return self.placer.placement_solver.compute_final_positions(
-            best_state.s1, best_state.s2, best_state.orientations
-        )
-    
     def _calc_boundary_from_terminals(self):
         """从terminal节点计算interposer边界"""
         terminal_mask = self.bench.is_terminal == 1
@@ -165,17 +159,6 @@ class PlacementRunner:
         tw = jnp.where(terminal_mask, self.bench.widths, 0)
         th = jnp.where(terminal_mask, self.bench.heights, 0)
         return float(jnp.max(tx + tw)), float(jnp.max(ty + th))
-    
-    def post_optimize(self, x, y, w, h, pins_dx, pins_dy):
-        """后处理优化（参数从config读取）"""
-        optimizer = PostOptimizer(self.bench, self.movable_indices)
-        return optimizer.optimize_with_annealing(
-            x, y, w, h, pins_dx, pins_dy,
-            boundary_width=self.boundary_width,
-            boundary_height=self.boundary_height,
-            max_iterations=self.config.annealing_phases,
-            search_points=self.config.search_points,
-        )
     
     def plot(self, x, y, w, h, pins_dx, pins_dy, filename, title=None):
         """绘制布局图（受 --no-viz 控制）"""
@@ -257,7 +240,7 @@ def main():
     
     # 运行MCTS
     start = time.time()
-    policy_output, best_state = runner.run_mcts()
+    policy_output = runner.run_mcts()
     print(f"MCTS运行时间: {time.time() - start:.2f}秒")
     
     runner.save_tree(policy_output)
@@ -359,31 +342,25 @@ def main():
             print(f"  方向优化 {i+1}/{top10_count}: PostOpt={before_h:.0f} → OriOpt={after_h:.0f}")
 
     # 选全局最优 & 画出各阶段的图
-    if ori_best_hpwl < running_best_hpwl:
-        trace_idx = int(top10_indices[ori_best_idx])
+    use_ori = ori_best_hpwl < running_best_hpwl
+    trace_idx = int(top10_indices[ori_best_idx]) if use_ori else best_idx
+    if use_ori:
         print(f"\n方向优化改善: {running_best_hpwl:.0f} → {ori_best_hpwl:.0f}")
 
-        runner.plot(mcts_raw_x[trace_idx], mcts_raw_y[trace_idx],
-                    mcts_raw_w[trace_idx], mcts_raw_h[trace_idx],
-                    mcts_raw_pdx[trace_idx], mcts_raw_pdy[trace_idx],
-                    "stage1_mcts.png", "Stage 1: MCTS")
-        runner.plot(all_opt_x[trace_idx], all_opt_y[trace_idx],
-                    all_w[trace_idx], all_h[trace_idx],
-                    all_pdx[trace_idx], all_pdy[trace_idx],
-                    "stage2_postopt.png", "Stage 2: PostOpt")
+    runner.plot(mcts_raw_x[trace_idx], mcts_raw_y[trace_idx],
+                mcts_raw_w[trace_idx], mcts_raw_h[trace_idx],
+                mcts_raw_pdx[trace_idx], mcts_raw_pdy[trace_idx],
+                "stage1_mcts.png", "Stage 1: MCTS")
+    runner.plot(all_opt_x[trace_idx], all_opt_y[trace_idx],
+                all_w[trace_idx], all_h[trace_idx],
+                all_pdx[trace_idx], all_pdy[trace_idx],
+                "stage2_postopt.png",
+                "Stage 2: PostOpt" + ("" if use_ori else " (Final)"))
+    if use_ori:
         runner.plot(ori_x[ori_best_idx], ori_y[ori_best_idx],
                     ori_w[ori_best_idx], ori_h[ori_best_idx],
                     ori_pdx[ori_best_idx], ori_pdy[ori_best_idx],
                     "stage3_oriopt.png", "Stage 3: OriOpt (Final)")
-    else:
-        runner.plot(mcts_raw_x[best_idx], mcts_raw_y[best_idx],
-                    mcts_raw_w[best_idx], mcts_raw_h[best_idx],
-                    mcts_raw_pdx[best_idx], mcts_raw_pdy[best_idx],
-                    "stage1_mcts.png", "Stage 1: MCTS")
-        runner.plot(all_opt_x[best_idx], all_opt_y[best_idx],
-                    all_w[best_idx], all_h[best_idx],
-                    all_pdx[best_idx], all_pdy[best_idx],
-                    "stage2_postopt.png", "Stage 2: PostOpt (Final)")
 
     print("\n" + "="*60)
     print("完成！")

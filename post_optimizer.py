@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 class PostOptimizer:
@@ -60,24 +60,6 @@ class PostOptimizer:
     
     @staticmethod
     @jax.jit
-    def _compute_total_overlap(x, y, w, h, movable_indices):
-        """GPU加速的总重叠面积计算"""
-        mx, my = x[movable_indices], y[movable_indices]
-        mw, mh = w[movable_indices], h[movable_indices]
-        
-        ov_x = jnp.maximum(0, jnp.minimum(mx[:, None] + mw[:, None],
-                                           mx[None, :] + mw[None, :]) -
-                              jnp.maximum(mx[:, None], mx[None, :]))
-        ov_y = jnp.maximum(0, jnp.minimum(my[:, None] + mh[:, None],
-                                           my[None, :] + mh[None, :]) -
-                              jnp.maximum(my[:, None], my[None, :]))
-        
-        n = movable_indices.shape[0]
-        mask = jnp.triu(jnp.ones((n, n), dtype=bool), k=1)
-        return jnp.sum(ov_x * ov_y * mask)
-    
-    @staticmethod
-    @jax.jit
     def _batch_find_best(opt_x, opt_y, widths, heights,
                          module_idx, candidate_x, candidate_y,
                          module_w, module_h,
@@ -112,24 +94,10 @@ class PostOptimizer:
         
         # 3. 批量计算HPWL (vmap: 一次GPU调用算完所有候选)
         def single_hpwl(cx_val, cy_val):
-            tx = opt_x.at[module_idx].set(cx_val)
-            ty = opt_y.at[module_idx].set(cy_val)
-            centers_x = tx + 0.5 * widths
-            centers_y = ty + 0.5 * heights
-            pw = widths[pins_nodes]
-            ph = heights[pins_nodes]
-            pin_x = centers_x[pins_nodes] + (pins_dx / 100.0) * pw
-            pin_y = centers_y[pins_nodes] + (pins_dy / 100.0) * ph
-            num_nets = nets_ptr.shape[0] - 1
-            counts = nets_ptr[1:] - nets_ptr[:-1]
-            seg_ids = jnp.repeat(jnp.arange(num_nets, dtype=jnp.int32), counts,
-                                 total_repeat_length=pins_nodes.shape[0])
-            return jnp.sum(
-                jax.ops.segment_max(pin_x, seg_ids, num_segments=num_nets) -
-                jax.ops.segment_min(pin_x, seg_ids, num_segments=num_nets) +
-                jax.ops.segment_max(pin_y, seg_ids, num_segments=num_nets) -
-                jax.ops.segment_min(pin_y, seg_ids, num_segments=num_nets)
-            )
+            return PostOptimizer._compute_hpwl_direct(
+                opt_x.at[module_idx].set(cx_val),
+                opt_y.at[module_idx].set(cy_val),
+                widths, heights, nets_ptr, pins_nodes, pins_dx, pins_dy)
         
         all_hpwl = jax.vmap(single_hpwl)(candidate_x, candidate_y)
         all_hpwl = jnp.where(valid, all_hpwl, jnp.inf)
@@ -234,8 +202,17 @@ class PostOptimizer:
                 movable_indices, module_local_idx,
                 nets_ptr, pins_nodes, pdx, pdy)
 
-            tx = ox1
-            ty = opt_y.at[module_idx].set(by)
+            # Phase 3: re-sweep x with updated y (coordinate descent)
+            oy1 = opt_y.at[module_idx].set(by)
+            y_rep2 = jnp.full_like(x_cands, by)
+            bx, _, _ = PostOptimizer._batch_find_best(
+                ox1, oy1, w, h,
+                module_idx, x_cands, y_rep2, mw, mh, bw, bh,
+                movable_indices, module_local_idx,
+                nets_ptr, pins_nodes, pdx, pdy)
+
+            tx = opt_x.at[module_idx].set(bx)
+            ty = oy1
             hpwl = PostOptimizer._compute_hpwl_direct(
                 tx, ty, w, h, nets_ptr, pins_nodes, pdx, pdy)
 
@@ -316,7 +293,8 @@ class PostOptimizer:
         def phase_body(phase, carry):
             ox, oy = carry
             t = phase / jnp.maximum(1, num_phases - 1)
-            cur_step = initial_step * (1 - t) + final_step * t
+            ratio = final_step / jnp.maximum(initial_step, final_step)
+            cur_step = initial_step * ratio ** t
             offsets_x = base_offsets_x * cur_step
             offsets_y = base_offsets_y * cur_step
             ox, oy = PostOptimizer._sweep_modules(
@@ -354,33 +332,6 @@ class PostOptimizer:
         gx, gy = gx.ravel(), gy.ravel()
         nonzero = (gx != 0) | (gy != 0)
         return jnp.where(nonzero, gx, 0.0), jnp.where(nonzero, gy, 0.0)
-
-    def optimize_with_annealing(self, x, y, widths, heights, pins_dx, pins_dy,
-                                boundary_width=None, boundary_height=None,
-                                max_iterations=5,
-                                search_points=20):
-        """退火策略后处理优化（单个方案）"""
-        if boundary_width is None or boundary_height is None:
-            boundary_width, boundary_height = self._get_boundary_from_terminals()
-        
-        bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
-        initial_step = jnp.float32(max(boundary_width, boundary_height) // search_points)
-        base_offsets_x, base_offsets_y = self._make_offsets(search_points)
-        
-        opt_x, opt_y = self._full_annealing(
-            jnp.array(x, dtype=jnp.float32), jnp.array(y, dtype=jnp.float32),
-            jnp.array(widths), jnp.array(heights),
-            self.movable_indices, bw, bh,
-            self.nets_ptr, self.pins_nodes, pins_dx, pins_dy,
-            jnp.int32(max_iterations),
-            initial_step, jnp.float32(1),
-            base_offsets_x, base_offsets_y)
-        
-        hpwl = float(self._compute_hpwl_direct(
-            opt_x, opt_y, jnp.array(widths), jnp.array(heights),
-            self.nets_ptr, self.pins_nodes, pins_dx, pins_dy))
-        
-        return opt_x, opt_y, hpwl
 
     def optimize_batch(self, all_x, all_y, all_w, all_h, all_pdx, all_pdy,
                        boundary_width=None, boundary_height=None,
