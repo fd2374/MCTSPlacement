@@ -238,13 +238,13 @@ class PostOptimizer:
     def optimize_with_annealing(self, x, y, widths, heights, pins_dx, pins_dy,
                                 boundary_width=None, boundary_height=None,
                                 max_iterations=5,
-                                initial_step=100, final_step=1,
                                 search_points=20):
         """退火策略后处理优化（单个方案）"""
         if boundary_width is None or boundary_height is None:
             boundary_width, boundary_height = self._get_boundary_from_terminals()
         
         bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
+        initial_step = jnp.float32(max(boundary_width, boundary_height) // search_points)
         base_offsets_x, base_offsets_y = self._make_offsets(search_points)
         
         opt_x, opt_y = self._full_annealing(
@@ -253,7 +253,7 @@ class PostOptimizer:
             self.movable_indices, bw, bh,
             self.nets_ptr, self.pins_nodes, pins_dx, pins_dy,
             jnp.int32(max_iterations),
-            jnp.float32(initial_step), jnp.float32(final_step),
+            initial_step, jnp.float32(1),
             base_offsets_x, base_offsets_y)
         
         hpwl = float(self._compute_hpwl_direct(
@@ -264,7 +264,7 @@ class PostOptimizer:
 
     def optimize_batch(self, all_x, all_y, all_w, all_h, all_pdx, all_pdy,
                        boundary_width=None, boundary_height=None,
-                       max_iterations=5, initial_step=10, final_step=1,
+                       max_iterations=5,
                        search_points=20, chunk_size=16,
                        num_random_orderings=3, seed=0):
         """批量后处理优化：K 个候选方案 × 多种排序策略，取逐候选最优"""
@@ -272,6 +272,7 @@ class PostOptimizer:
             boundary_width, boundary_height = self._get_boundary_from_terminals()
 
         bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
+        initial_step = jnp.float32(max(boundary_width, boundary_height) // search_points)
         base_offsets_x, base_offsets_y = self._make_offsets(search_points)
 
         orderings = [self.movable_indices_asc, self.movable_indices_desc]
@@ -299,7 +300,7 @@ class PostOptimizer:
             shared = (mi, bw, bh,
                       self.nets_ptr, self.pins_nodes,
                       jnp.int32(max_iterations),
-                      jnp.float32(initial_step), jnp.float32(final_step),
+                      initial_step, jnp.float32(1),
                       base_offsets_x, base_offsets_y)
 
             res_x, res_y, res_h = [], [], []

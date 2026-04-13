@@ -1,0 +1,16 @@
+# xerox_scaled10 数据集配置
+base_path: "./data/xerox_scaled10"
+
+# MCTS参数
+sims: 1000
+batch: 1000
+
+# Interposer边界（注释掉则从terminal自动计算）
+width: 4862
+height: 4422
+
+# 后处理优化
+search_points: 20
+annealing_phases: 100
+
+no_tree: true

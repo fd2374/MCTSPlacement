@@ -21,15 +21,13 @@ class PlacementConfig:
     num_simulations: int = 100
     seed: int = 0
     batch_size: int = 1
-    gumbel_scale: float = 1.0
+    gumbel_scale: float = 0.1
     
     # Interposer边界（None = 从terminal自动计算）
     boundary_width: Optional[float] = None
     boundary_height: Optional[float] = None
     
     # 后处理优化参数
-    initial_step: float = 10.0
-    final_step: float = 1.0
     search_points: int = 20
     annealing_phases: int = 5
     

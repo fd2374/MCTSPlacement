@@ -174,8 +174,6 @@ class PlacementRunner:
             boundary_width=self.boundary_width,
             boundary_height=self.boundary_height,
             max_iterations=self.config.annealing_phases,
-            initial_step=self.config.initial_step,
-            final_step=self.config.final_step,
             search_points=self.config.search_points,
         )
     
@@ -224,8 +222,6 @@ def create_config_from_args() -> PlacementConfig:
     parser.add_argument('--gumbel-scale', type=float, default=None, help='Gumbel缩放因子')
     parser.add_argument('--width', type=float, default=None, help='Interposer宽度')
     parser.add_argument('--height', type=float, default=None, help='Interposer高度')
-    parser.add_argument('--initial-step', type=float, default=None, help='后处理初始步长')
-    parser.add_argument('--final-step', type=float, default=None, help='后处理最终步长')
     parser.add_argument('--search-points', type=int, default=None, help='搜索点数')
     parser.add_argument('--annealing-phases', type=int, default=None, help='退火阶段数')
     parser.add_argument('--no-tree', action='store_true', help='不保存搜索树图')
@@ -286,8 +282,6 @@ def main():
         boundary_width=runner.boundary_width,
         boundary_height=runner.boundary_height,
         max_iterations=config.annealing_phases,
-        initial_step=config.initial_step,
-        final_step=config.final_step,
         search_points=config.search_points)
 
     print(f"后处理优化时间: {time.time() - start:.2f}秒")
