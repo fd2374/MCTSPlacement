@@ -3,7 +3,7 @@ base_path: "./data/testcase_8die_big_b4"
 
 # MCTS参数
 sims: 1000
-batch: 1000
+batch: 100
 
 # Interposer边界（注释掉则从terminal自动计算）
 width: 32400
@@ -11,6 +11,6 @@ height: 32240
 
 # 后处理优化
 search_points: 20
-annealing_phases: 100
+annealing_phases: 10
 
 no_tree: true
