@@ -17,7 +17,11 @@ class PostOptimizer:
     
     def __init__(self, bench, movable_indices: jnp.ndarray):
         self.bench = bench
-        self.movable_indices = jnp.array(movable_indices)
+        mi = jnp.array(movable_indices)
+        areas = bench.widths[mi] * bench.heights[mi]
+        self.movable_indices_asc = mi[jnp.argsort(areas)]
+        self.movable_indices_desc = mi[jnp.argsort(-areas)]
+        self.movable_indices = self.movable_indices_asc
         self.num_movable = len(movable_indices)
         
         self.nets_ptr = bench.nets_ptr
@@ -187,7 +191,8 @@ class PostOptimizer:
                         nets_ptr, pins_nodes, pins_dx, pins_dy,
                         num_phases, initial_step, final_step,
                         base_offsets_x, base_offsets_y):
-        """逐步缩小搜索半径，每步做一轮贪心 sweep"""
+        """逐步缩小搜索半径，按面积排序 sweep"""
+
         def phase_body(phase, carry):
             ox, oy = carry
             t = phase / jnp.maximum(1, num_phases - 1)
@@ -233,7 +238,7 @@ class PostOptimizer:
     def optimize_with_annealing(self, x, y, widths, heights, pins_dx, pins_dy,
                                 boundary_width=None, boundary_height=None,
                                 max_iterations=5,
-                                initial_step=10, final_step=1,
+                                initial_step=100, final_step=1,
                                 search_points=20):
         """退火策略后处理优化（单个方案）"""
         if boundary_width is None or boundary_height is None:
@@ -260,18 +265,20 @@ class PostOptimizer:
     def optimize_batch(self, all_x, all_y, all_w, all_h, all_pdx, all_pdy,
                        boundary_width=None, boundary_height=None,
                        max_iterations=5, initial_step=10, final_step=1,
-                       search_points=20, chunk_size=32):
-        """批量后处理优化：K 个候选方案分块 vmap 并行"""
+                       search_points=20, chunk_size=16,
+                       num_random_orderings=3, seed=0):
+        """批量后处理优化：K 个候选方案 × 多种排序策略，取逐候选最优"""
         if boundary_width is None or boundary_height is None:
             boundary_width, boundary_height = self._get_boundary_from_terminals()
 
         bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
         base_offsets_x, base_offsets_y = self._make_offsets(search_points)
-        shared = (self.movable_indices, bw, bh,
-                  self.nets_ptr, self.pins_nodes,
-                  jnp.int32(max_iterations),
-                  jnp.float32(initial_step), jnp.float32(final_step),
-                  base_offsets_x, base_offsets_y)
+
+        orderings = [self.movable_indices_asc, self.movable_indices_desc]
+        rng = jax.random.PRNGKey(seed)
+        for _ in range(num_random_orderings):
+            rng, subkey = jax.random.split(rng)
+            orderings.append(jax.random.permutation(subkey, self.movable_indices_asc))
 
         K = all_x.shape[0]
         pad = (-K) % chunk_size
@@ -282,18 +289,39 @@ class PostOptimizer:
             all_w, all_h = p(all_w), p(all_h)
             all_pdx, all_pdy = p(all_pdx), p(all_pdy)
 
-        res_x, res_y, res_h = [], [], []
         total = all_x.shape[0]
-        for start in range(0, total, chunk_size):
-            end = start + chunk_size
-            ox, oy, hpwl = self._vmap_annealing(
-                all_x[start:end], all_y[start:end],
-                all_w[start:end], all_h[start:end],
-                all_pdx[start:end], all_pdy[start:end], *shared)
-            res_x.append(ox)
-            res_y.append(oy)
-            res_h.append(hpwl)
+        best_x = jnp.zeros_like(all_x)
+        best_y = jnp.zeros_like(all_y)
+        best_h = jnp.full(total, jnp.inf)
 
-        return (jnp.concatenate(res_x)[:K],
-                jnp.concatenate(res_y)[:K],
-                jnp.concatenate(res_h)[:K])
+        labels = ["面积升序", "面积降序"] + [f"随机{i+1}" for i in range(num_random_orderings)]
+        for oi, mi in enumerate(orderings):
+            shared = (mi, bw, bh,
+                      self.nets_ptr, self.pins_nodes,
+                      jnp.int32(max_iterations),
+                      jnp.float32(initial_step), jnp.float32(final_step),
+                      base_offsets_x, base_offsets_y)
+
+            res_x, res_y, res_h = [], [], []
+            for start in range(0, total, chunk_size):
+                end = start + chunk_size
+                ox, oy, hpwl = self._vmap_annealing(
+                    all_x[start:end], all_y[start:end],
+                    all_w[start:end], all_h[start:end],
+                    all_pdx[start:end], all_pdy[start:end], *shared)
+                res_x.append(ox)
+                res_y.append(oy)
+                res_h.append(hpwl)
+
+            cur_x = jnp.concatenate(res_x)
+            cur_y = jnp.concatenate(res_y)
+            cur_h = jnp.concatenate(res_h)
+
+            improved = cur_h < best_h
+            best_x = jnp.where(improved[:, None], cur_x, best_x)
+            best_y = jnp.where(improved[:, None], cur_y, best_y)
+            best_h = jnp.minimum(best_h, cur_h)
+            cur_best = float(jnp.min(best_h[:K]))
+            print(f"    策略 {oi+1}/{len(orderings)} [{labels[oi]}] 完成, 当前全局最优={cur_best:.0f}")
+
+        return best_x[:K], best_y[:K], best_h[:K]

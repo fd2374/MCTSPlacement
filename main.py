@@ -267,7 +267,7 @@ def main():
     runner.save_tree(policy_output)
     
     # 提取 top-K 候选方案（每个 batch 的最佳终端状态）
-    top_k = min(config.batch_size, 1000)
+    top_k = config.batch_size // 5 + 1
     top_states, top_mcts_hpwls, k = runner._extract_top_k_states(
         policy_output.search_tree, top_k
     )
@@ -290,19 +290,25 @@ def main():
         final_step=config.final_step,
         search_points=config.search_points)
 
-    valid_mask = (top_mcts_hpwls > 0) & (top_mcts_hpwls < jnp.inf)
-    masked_hpwls = jnp.where(valid_mask, all_hpwls, jnp.inf)
-    best_idx = int(jnp.argmin(masked_hpwls))
+    print(f"后处理优化时间: {time.time() - start:.2f}秒")
 
+    # 按 MCTS HPWL 从小到大逐个显示，tracking running best
+    print(f"\n候选结果（按 MCTS HPWL 升序）:")
+    running_best_hpwl = float('inf')
+    running_best_idx = -1
     for i in range(k):
         mcts_h = float(top_mcts_hpwls[i])
         if mcts_h <= 0 or mcts_h == float('inf'):
             continue
         opt_h = float(all_hpwls[i])
-        tag = " ← 最优" if i == best_idx else ""
-        print(f"  候选 {i+1}/{k}: MCTS={mcts_h:.0f} → PostOpt={opt_h:.0f}{tag}")
+        if opt_h < running_best_hpwl:
+            running_best_hpwl = opt_h
+            running_best_idx = i
+            print(f"  候选 {i+1}/{k}: MCTS={mcts_h:.0f} → PostOpt={opt_h:.0f} ← 最优")
+        else:
+            print(f"  候选 {i+1}/{k}: MCTS={mcts_h:.0f} → PostOpt={opt_h:.0f}")
 
-    print(f"后处理优化时间: {time.time() - start:.2f}秒")
+    best_idx = running_best_idx
 
     # 画最终最优结果
     opt_x, opt_y = all_opt_x[best_idx], all_opt_y[best_idx]
