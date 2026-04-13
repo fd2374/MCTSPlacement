@@ -202,29 +202,48 @@ class PostOptimizer:
         opt_x, opt_y = jax.lax.fori_loop(0, num_phases, phase_body, (opt_x, opt_y))
         return opt_x, opt_y
     
-    def optimize_with_annealing(self, x, y, widths, heights, pins_dx, pins_dy,
-                                boundary_width=None, boundary_height=None,
-                                max_iterations=5,
-                                initial_step=10, final_step=1,
-                                search_points=20):
-        """退火策略后处理优化（入口函数）"""
-        if boundary_width is None or boundary_height is None:
-            boundary_width, boundary_height = self._get_boundary_from_terminals()
-        
-        opt_x = jnp.array(x, dtype=jnp.float32)
-        opt_y = jnp.array(y, dtype=jnp.float32)
-        bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
-        
+    @staticmethod
+    @jax.jit
+    def _vmap_annealing(batch_x, batch_y, batch_w, batch_h, batch_pdx, batch_pdy,
+                        movable_indices, bw, bh, nets_ptr, pins_nodes,
+                        num_phases, initial_step, final_step,
+                        base_offsets_x, base_offsets_y):
+        """vmap 并行退火：一次 GPU 调用处理整个 chunk"""
+        def single(args):
+            x, y, w, h, pdx, pdy = args
+            ox, oy = PostOptimizer._full_annealing(
+                x, y, w, h, movable_indices, bw, bh,
+                nets_ptr, pins_nodes, pdx, pdy,
+                num_phases, initial_step, final_step,
+                base_offsets_x, base_offsets_y)
+            hpwl = PostOptimizer._compute_hpwl_direct(
+                ox, oy, w, h, nets_ptr, pins_nodes, pdx, pdy)
+            return ox, oy, hpwl
+        return jax.vmap(single)((batch_x, batch_y, batch_w, batch_h,
+                                 batch_pdx, batch_pdy))
+
+    def _make_offsets(self, search_points):
         sp = search_points
         offsets_1d = jnp.arange(-sp, sp + 1, dtype=jnp.float32)
         gx, gy = jnp.meshgrid(offsets_1d, offsets_1d)
         gx, gy = gx.ravel(), gy.ravel()
         nonzero = (gx != 0) | (gy != 0)
-        base_offsets_x = jnp.where(nonzero, gx, 0.0)
-        base_offsets_y = jnp.where(nonzero, gy, 0.0)
+        return jnp.where(nonzero, gx, 0.0), jnp.where(nonzero, gy, 0.0)
+
+    def optimize_with_annealing(self, x, y, widths, heights, pins_dx, pins_dy,
+                                boundary_width=None, boundary_height=None,
+                                max_iterations=5,
+                                initial_step=10, final_step=1,
+                                search_points=20):
+        """退火策略后处理优化（单个方案）"""
+        if boundary_width is None or boundary_height is None:
+            boundary_width, boundary_height = self._get_boundary_from_terminals()
+        
+        bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
+        base_offsets_x, base_offsets_y = self._make_offsets(search_points)
         
         opt_x, opt_y = self._full_annealing(
-            opt_x, opt_y,
+            jnp.array(x, dtype=jnp.float32), jnp.array(y, dtype=jnp.float32),
             jnp.array(widths), jnp.array(heights),
             self.movable_indices, bw, bh,
             self.nets_ptr, self.pins_nodes, pins_dx, pins_dy,
@@ -237,3 +256,44 @@ class PostOptimizer:
             self.nets_ptr, self.pins_nodes, pins_dx, pins_dy))
         
         return opt_x, opt_y, hpwl
+
+    def optimize_batch(self, all_x, all_y, all_w, all_h, all_pdx, all_pdy,
+                       boundary_width=None, boundary_height=None,
+                       max_iterations=5, initial_step=10, final_step=1,
+                       search_points=20, chunk_size=32):
+        """批量后处理优化：K 个候选方案分块 vmap 并行"""
+        if boundary_width is None or boundary_height is None:
+            boundary_width, boundary_height = self._get_boundary_from_terminals()
+
+        bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
+        base_offsets_x, base_offsets_y = self._make_offsets(search_points)
+        shared = (self.movable_indices, bw, bh,
+                  self.nets_ptr, self.pins_nodes,
+                  jnp.int32(max_iterations),
+                  jnp.float32(initial_step), jnp.float32(final_step),
+                  base_offsets_x, base_offsets_y)
+
+        K = all_x.shape[0]
+        pad = (-K) % chunk_size
+        if pad > 0:
+            def p(a):
+                return jnp.concatenate([a, jnp.zeros((pad,) + a.shape[1:], dtype=a.dtype)])
+            all_x, all_y = p(all_x), p(all_y)
+            all_w, all_h = p(all_w), p(all_h)
+            all_pdx, all_pdy = p(all_pdx), p(all_pdy)
+
+        res_x, res_y, res_h = [], [], []
+        total = all_x.shape[0]
+        for start in range(0, total, chunk_size):
+            end = start + chunk_size
+            ox, oy, hpwl = self._vmap_annealing(
+                all_x[start:end], all_y[start:end],
+                all_w[start:end], all_h[start:end],
+                all_pdx[start:end], all_pdy[start:end], *shared)
+            res_x.append(ox)
+            res_y.append(oy)
+            res_h.append(hpwl)
+
+        return (jnp.concatenate(res_x)[:K],
+                jnp.concatenate(res_y)[:K],
+                jnp.concatenate(res_h)[:K])

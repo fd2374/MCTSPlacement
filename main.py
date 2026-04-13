@@ -272,39 +272,42 @@ def main():
         policy_output.search_tree, top_k
     )
     
-    # 显示 MCTS 最佳结果（优化前）
-    x, y, w, h, pins_dx, pins_dy = runner.get_coords(best_state)
-    
-    # 对所有候选方案运行后处理优化，取最优
-    print(f"\n开始后处理优化（{k} 个候选方案）...")
+    # 对所有候选方案批量后处理优化
+    print(f"\n开始后处理优化（{k} 个候选方案，GPU 并行）...")
     start = time.time()
-    
-    best_hpwl = float('inf')
-    best_result = None
-    
+
+    all_x, all_y, all_w, all_h, all_pdx, all_pdy = jax.vmap(
+        lambda s1, s2, ori: runner.placer.placement_solver.compute_final_positions(s1, s2, ori)
+    )(top_states.s1, top_states.s2, top_states.orientations)
+
+    optimizer = PostOptimizer(runner.bench, runner.movable_indices)
+    all_opt_x, all_opt_y, all_hpwls = optimizer.optimize_batch(
+        all_x, all_y, all_w, all_h, all_pdx, all_pdy,
+        boundary_width=runner.boundary_width,
+        boundary_height=runner.boundary_height,
+        max_iterations=config.annealing_phases,
+        initial_step=config.initial_step,
+        final_step=config.final_step,
+        search_points=config.search_points)
+
+    valid_mask = (top_mcts_hpwls > 0) & (top_mcts_hpwls < jnp.inf)
+    masked_hpwls = jnp.where(valid_mask, all_hpwls, jnp.inf)
+    best_idx = int(jnp.argmin(masked_hpwls))
+
     for i in range(k):
-        mcts_hpwl = float(top_mcts_hpwls[i])
-        if mcts_hpwl <= 0 or mcts_hpwl == float('inf'):
+        mcts_h = float(top_mcts_hpwls[i])
+        if mcts_h <= 0 or mcts_h == float('inf'):
             continue
-        
-        state_i = PlacementState(
-            s1=top_states.s1[i], s2=top_states.s2[i],
-            orientations=top_states.orientations[i], step=top_states.step[i],
-        )
-        xi, yi, wi, hi, pdx, pdy = runner.get_coords(state_i)
-        opt_x, opt_y, hpwl = runner.post_optimize(xi, yi, wi, hi, pdx, pdy)
-        
-        tag = ""
-        if hpwl < best_hpwl:
-            best_hpwl = hpwl
-            best_result = (opt_x, opt_y, wi, hi, pdx, pdy)
-            tag = " ← 最优"
-        print(f"  候选 {i+1}/{k}: MCTS={mcts_hpwl:.0f} → PostOpt={hpwl:.0f}{tag}")
-    
+        opt_h = float(all_hpwls[i])
+        tag = " ← 最优" if i == best_idx else ""
+        print(f"  候选 {i+1}/{k}: MCTS={mcts_h:.0f} → PostOpt={opt_h:.0f}{tag}")
+
     print(f"后处理优化时间: {time.time() - start:.2f}秒")
-    
+
     # 画最终最优结果
-    opt_x, opt_y, w, h, pins_dx, pins_dy = best_result
+    opt_x, opt_y = all_opt_x[best_idx], all_opt_y[best_idx]
+    w, h = all_w[best_idx], all_h[best_idx]
+    pins_dx, pins_dy = all_pdx[best_idx], all_pdy[best_idx]
     runner.plot(opt_x, opt_y, w, h, pins_dx, pins_dy, "best_placement.png", "优化后")
     
     print("\n" + "="*60)

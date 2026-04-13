@@ -58,8 +58,8 @@ class MCTSPlacer:
             state.s1, state.s2, state.orientations
         )
     
-    def rollout(self, state: PlacementState, rng_key) -> jnp.ndarray:
-        """执行rollout直到结束并返回奖励"""
+    def _single_rollout(self, state: PlacementState, rng_key) -> jnp.ndarray:
+        """单次 rollout 到终态并返回奖励"""
         def cond(a):
             state, key = a
             return state.step < 3 * self.num_movable
@@ -73,6 +73,12 @@ class MCTSPlacer:
             
         leaf, key = jax.lax.while_loop(cond, step, (state, rng_key))
         return self.compute_reward(leaf)
+
+    def rollout(self, state: PlacementState, rng_key, n_rollouts: int = 8) -> jnp.ndarray:
+        """K 次并行 rollout 取均值，vmap 在 GPU 上几乎零额外开销"""
+        keys = jax.random.split(rng_key, n_rollouts)
+        values = jax.vmap(lambda k: self._single_rollout(state, k))(keys)
+        return jnp.mean(values)
     
     def compute_reward(self, state: PlacementState) -> jnp.ndarray:
         """计算奖励（仅在终端状态）"""
