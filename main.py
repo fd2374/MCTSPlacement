@@ -304,12 +304,50 @@ def main():
 
     best_idx = running_best_idx
 
-    # 画最终最优结果
-    opt_x, opt_y = all_opt_x[best_idx], all_opt_y[best_idx]
-    w, h = all_w[best_idx], all_h[best_idx]
-    pins_dx, pins_dy = all_pdx[best_idx], all_pdy[best_idx]
+    # Phase 2: 方向优化（对 top-10 方案贪心翻转每个模块方向 + 重新退火）
+    top10_count = min(10, k)
+    top10_indices = jnp.argsort(all_hpwls)[:top10_count]
+
+    print(f"\n开始方向优化（top {top10_count} 候选）...")
+    start = time.time()
+
+    ori_x, ori_y, ori_w, ori_h, ori_pdx, ori_pdy, ori_hpwls = optimizer.optimize_orientations(
+        all_opt_x[top10_indices], all_opt_y[top10_indices],
+        all_w[top10_indices], all_h[top10_indices],
+        all_pdx[top10_indices], all_pdy[top10_indices],
+        boundary_width=runner.boundary_width,
+        boundary_height=runner.boundary_height,
+        search_points=config.search_points,
+        annealing_phases=config.annealing_phases)
+
+    print(f"方向优化时间: {time.time() - start:.2f}秒")
+
+    print(f"\n方向优化结果:")
+    ori_best_idx = -1
+    ori_best_hpwl = float('inf')
+    for i in range(top10_count):
+        before_h = float(all_hpwls[int(top10_indices[i])])
+        after_h = float(ori_hpwls[i])
+        if after_h < ori_best_hpwl:
+            ori_best_hpwl = after_h
+            ori_best_idx = i
+            print(f"  方向优化 {i+1}/{top10_count}: PostOpt={before_h:.0f} → OriOpt={after_h:.0f} ← 最优")
+        else:
+            print(f"  方向优化 {i+1}/{top10_count}: PostOpt={before_h:.0f} → OriOpt={after_h:.0f}")
+
+    # 选全局最优：位置优化 vs 方向优化
+    if ori_best_hpwl < running_best_hpwl:
+        opt_x, opt_y = ori_x[ori_best_idx], ori_y[ori_best_idx]
+        w, h = ori_w[ori_best_idx], ori_h[ori_best_idx]
+        pins_dx, pins_dy = ori_pdx[ori_best_idx], ori_pdy[ori_best_idx]
+        print(f"\n方向优化改善: {running_best_hpwl:.0f} → {ori_best_hpwl:.0f}")
+    else:
+        opt_x, opt_y = all_opt_x[best_idx], all_opt_y[best_idx]
+        w, h = all_w[best_idx], all_h[best_idx]
+        pins_dx, pins_dy = all_pdx[best_idx], all_pdy[best_idx]
+
     runner.plot(opt_x, opt_y, w, h, pins_dx, pins_dy, "best_placement.png", "优化后")
-    
+
     print("\n" + "="*60)
     print("完成！")
     print("="*60)
