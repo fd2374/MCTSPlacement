@@ -182,70 +182,23 @@ class PostOptimizer:
     
     @staticmethod
     @jax.jit
-    def _optimize_iterations(opt_x, opt_y, widths, heights,
-                             movable_indices, offsets_x, offsets_y,
-                             bw, bh, nets_ptr, pins_nodes, pins_dx, pins_dy,
-                             max_iterations):
-        """多轮 sweep 迭代，带早停（全部在 GPU 上，零 CPU 同步）"""
-        def compute_hpwl(ox, oy):
-            centers_x = ox + 0.5 * widths
-            centers_y = oy + 0.5 * heights
-            pw = widths[pins_nodes]
-            ph = heights[pins_nodes]
-            pin_x = centers_x[pins_nodes] + (pins_dx / 100.0) * pw
-            pin_y = centers_y[pins_nodes] + (pins_dy / 100.0) * ph
-            num_nets = nets_ptr.shape[0] - 1
-            counts = nets_ptr[1:] - nets_ptr[:-1]
-            seg_ids = jnp.repeat(jnp.arange(num_nets, dtype=jnp.int32), counts,
-                                 total_repeat_length=pins_nodes.shape[0])
-            return jnp.sum(
-                jax.ops.segment_max(pin_x, seg_ids, num_segments=num_nets) -
-                jax.ops.segment_min(pin_x, seg_ids, num_segments=num_nets) +
-                jax.ops.segment_max(pin_y, seg_ids, num_segments=num_nets) -
-                jax.ops.segment_min(pin_y, seg_ids, num_segments=num_nets))
-        
-        init_hpwl = compute_hpwl(opt_x, opt_y)
-        
-        def cond(carry):
-            ox, oy, prev_hpwl, i, cont = carry
-            return cont & (i < max_iterations)
-        
-        def body(carry):
-            ox, oy, prev_hpwl, i, _ = carry
-            ox, oy = PostOptimizer._sweep_modules(
-                ox, oy, widths, heights, movable_indices, offsets_x, offsets_y,
-                bw, bh, nets_ptr, pins_nodes, pins_dx, pins_dy)
-            cur_hpwl = compute_hpwl(ox, oy)
-            improved = cur_hpwl < prev_hpwl - 1e-6
-            return ox, oy, cur_hpwl, i + 1, improved
-        
-        ox, oy, final_hpwl, _, _ = jax.lax.while_loop(
-            cond, body, (opt_x, opt_y, init_hpwl, jnp.int32(0), jnp.bool_(True)))
-        return ox, oy, final_hpwl
-    
-    @staticmethod
-    @jax.jit
     def _full_annealing(opt_x, opt_y, widths, heights,
                         movable_indices, bw, bh,
                         nets_ptr, pins_nodes, pins_dx, pins_dy,
-                        num_phases, iters_per_phase, initial_step, final_step,
+                        num_phases, initial_step, final_step,
                         base_offsets_x, base_offsets_y):
-        """完整的退火优化流程（全部在 GPU 上，单个 kernel）
-        
-        将退火阶段循环 + 每阶段的迭代优化全部编译进 XLA，
-        整个过程零 CPU-GPU 同步。
-        """
+        """逐步缩小搜索半径，每步做一轮贪心 sweep"""
         def phase_body(phase, carry):
             ox, oy = carry
             t = phase / jnp.maximum(1, num_phases - 1)
             cur_step = initial_step * (1 - t) + final_step * t
             offsets_x = base_offsets_x * cur_step
             offsets_y = base_offsets_y * cur_step
-            ox, oy, _ = PostOptimizer._optimize_iterations(
+            ox, oy = PostOptimizer._sweep_modules(
                 ox, oy, widths, heights, movable_indices, offsets_x, offsets_y,
-                bw, bh, nets_ptr, pins_nodes, pins_dx, pins_dy, iters_per_phase)
+                bw, bh, nets_ptr, pins_nodes, pins_dx, pins_dy)
             return ox, oy
-        
+
         opt_x, opt_y = jax.lax.fori_loop(0, num_phases, phase_body, (opt_x, opt_y))
         return opt_x, opt_y
     
@@ -275,7 +228,7 @@ class PostOptimizer:
             jnp.array(widths), jnp.array(heights),
             self.movable_indices, bw, bh,
             self.nets_ptr, self.pins_nodes, pins_dx, pins_dy,
-            jnp.int32(max_iterations), jnp.int32(3),
+            jnp.int32(max_iterations),
             jnp.float32(initial_step), jnp.float32(final_step),
             base_offsets_x, base_offsets_y)
         
