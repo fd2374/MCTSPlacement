@@ -35,6 +35,7 @@ class PlacementConfig:
     output_dir: str = "."
     save_visualization: bool = True
     save_tree: bool = True
+    save_gif: bool = False
     
     # YAML键名 -> dataclass字段名 映射
     _KEY_MAP = {
@@ -43,6 +44,7 @@ class PlacementConfig:
         'width': 'boundary_height',
         'height': 'boundary_width',
         'output': 'output_dir',
+        'gif': 'save_gif',
     }
     
     def validate(self) -> None:

@@ -209,6 +209,7 @@ def create_config_from_args() -> PlacementConfig:
     parser.add_argument('--annealing-phases', type=int, default=None, help='退火阶段数')
     parser.add_argument('--no-tree', action='store_true', help='不保存搜索树图')
     parser.add_argument('--no-viz', action='store_true', help='不保存可视化')
+    parser.add_argument('--gif', action='store_true', help='生成各阶段动画GIF')
     
     args = parser.parse_args()
     
@@ -361,6 +362,65 @@ def main():
                     ori_w[ori_best_idx], ori_h[ori_best_idx],
                     ori_pdx[ori_best_idx], ori_pdy[ori_best_idx],
                     "stage3_oriopt.png", "Stage 3: OriOpt (Final)")
+
+    # GIF generation
+    if config.save_gif:
+        from animation import create_mcts_gif, create_sa_gif, create_orientation_gif
+        gif_t0 = time.time()
+        print("\n生成动画GIF...")
+
+        gif_bw, gif_bh = float(runner.boundary_width), float(runner.boundary_height)
+
+        gif_mcts_x = mcts_raw_x[trace_idx]
+        gif_mcts_y = mcts_raw_y[trace_idx]
+        gif_mcts_w = mcts_raw_w[trace_idx]
+        gif_mcts_h = mcts_raw_h[trace_idx]
+        gif_mcts_pdx = mcts_raw_pdx[trace_idx]
+        gif_mcts_pdy = mcts_raw_pdy[trace_idx]
+
+        gif_sa_x = all_opt_x[trace_idx]
+        gif_sa_y = all_opt_y[trace_idx]
+        gif_sa_w = all_w[trace_idx]
+        gif_sa_h = all_h[trace_idx]
+        gif_sa_pdx = all_pdx[trace_idx]
+        gif_sa_pdy = all_pdy[trace_idx]
+
+        hpwl_fn = PostOptimizer._compute_hpwl_direct
+        h_mcts = float(hpwl_fn(gif_mcts_x, gif_mcts_y, gif_mcts_w, gif_mcts_h,
+                                runner.bench.nets_ptr, runner.bench.pins_nodes,
+                                gif_mcts_pdx, gif_mcts_pdy))
+        h_sa = float(hpwl_fn(gif_sa_x, gif_sa_y, gif_sa_w, gif_sa_h,
+                              runner.bench.nets_ptr, runner.bench.pins_nodes,
+                              gif_sa_pdx, gif_sa_pdy))
+        print(f"  GIF数据验证: MCTS->SA起点 HPWL={h_mcts:.0f}, SA终点=ORI起点 HPWL={h_sa:.0f}")
+
+        create_mcts_gif(
+            policy_output.search_tree, runner.placer,
+            runner.num_movable, 0,
+            f'{config.output_dir}/stage1_mcts.gif',
+            final_placement=(gif_mcts_x, gif_mcts_y, gif_mcts_w, gif_mcts_h,
+                             gif_mcts_pdx, gif_mcts_pdy),
+            boundary_wh=(gif_bw, gif_bh))
+
+        create_sa_gif(
+            optimizer,
+            gif_mcts_x, gif_mcts_y, gif_mcts_w, gif_mcts_h,
+            gif_mcts_pdx, gif_mcts_pdy,
+            runner.bench, gif_bw, gif_bh,
+            config.search_points, config.annealing_phases,
+            f'{config.output_dir}/stage2_sa.gif',
+            target_x=gif_sa_x, target_y=gif_sa_y,
+            target_w=gif_sa_w, target_h=gif_sa_h,
+            target_pdx=gif_sa_pdx, target_pdy=gif_sa_pdy)
+
+        create_orientation_gif(
+            optimizer,
+            gif_sa_x, gif_sa_y, gif_sa_w, gif_sa_h,
+            gif_sa_pdx, gif_sa_pdy,
+            runner.bench, gif_bw, gif_bh,
+            config.search_points, config.annealing_phases,
+            f'{config.output_dir}/stage3_orientation.gif')
+        print(f"GIF生成总耗时: {time.time()-gif_t0:.1f}s")
 
     print("\n" + "="*60)
     print("完成！")
