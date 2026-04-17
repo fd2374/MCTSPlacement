@@ -22,6 +22,10 @@ class PlacementConfig:
     seed: int = 0
     batch_size: int = 1
     gumbel_scale: float = 0.1
+    # OOB 软惩罚系数：reward = -HPWL * (1 + alpha * oob_ratio)
+    # oob_ratio = bbox 越界比率（归一化到 interposer 尺寸），clip 到 10
+    # 0 = 不惩罚（等同原逻辑）；1~3 对紧约束场景有效
+    oob_penalty_alpha: float = 1.0
     
     # Interposer边界（None = 从terminal自动计算）
     boundary_width: Optional[float] = None

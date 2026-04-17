@@ -65,8 +65,13 @@ class PlacementRunner:
         # 按面积排序模块（降序）
         ordered_modules = jax.random.permutation(jax.random.PRNGKey(self.config.seed), self.movable_indices)
         
-        # 创建MCTS布局器
-        self.placer = MCTSPlacer(self.bench, jnp.array(self.movable_indices), ordered_modules)
+        # 创建MCTS布局器（传入 interposer 边界 + OOB 软惩罚系数）
+        self.placer = MCTSPlacer(
+            self.bench, jnp.array(self.movable_indices), ordered_modules,
+            boundary_width=self.boundary_width,
+            boundary_height=self.boundary_height,
+            oob_penalty_alpha=self.config.oob_penalty_alpha,
+        )
         
         # 运行MCTS
         rng_key = jax.random.PRNGKey(self.config.seed)
@@ -262,6 +267,8 @@ def create_config_from_args() -> PlacementConfig:
     parser.add_argument('--height', type=float, default=None, help='Interposer高度')
     parser.add_argument('--search-points', type=int, default=None, help='搜索点数')
     parser.add_argument('--annealing-phases', type=int, default=None, help='退火阶段数')
+    parser.add_argument('--oob-penalty-alpha', type=float, default=None,
+                        help='OOB软惩罚系数 (reward=-HPWL*(1+alpha*oob_ratio)); 默认1.0')
     parser.add_argument('--no-tree', action='store_true', help='不保存搜索树图')
     parser.add_argument('--no-viz', action='store_true', help='不保存可视化')
     parser.add_argument('--gif', action='store_true', help='生成各阶段动画GIF')
