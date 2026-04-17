@@ -267,7 +267,7 @@ def create_config_from_args() -> PlacementConfig:
     parser.add_argument('--height', type=float, default=None, help='Interposer高度')
     parser.add_argument('--search-points', type=int, default=None, help='搜索点数')
     parser.add_argument('--annealing-phases', type=int, default=None, help='退火阶段数')
-    parser.add_argument('--oob-penalty-alpha', type=float, default=None,
+    parser.add_argument('--oob-penalty-alpha', type=float, default=0.0,
                         help='OOB软惩罚系数 (reward=-HPWL*(1+alpha*oob_ratio)); 默认1.0')
     parser.add_argument('--no-tree', action='store_true', help='不保存搜索树图')
     parser.add_argument('--no-viz', action='store_true', help='不保存可视化')
