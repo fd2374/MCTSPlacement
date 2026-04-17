@@ -10,7 +10,7 @@ width: 6412
 height: 5831
 
 # 后处理优化
-search_points: 20
-annealing_phases: 100
+search_points: 10
+annealing_phases: 10
 
 no_tree: true

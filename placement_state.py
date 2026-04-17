@@ -14,6 +14,12 @@ class PlacementState(NamedTuple):
     s2: jnp.ndarray           # 当前序列2（部分构建）
     orientations: jnp.ndarray # 当前方向（0=N, 1=E, 2=S, 3=W）
     step: jnp.ndarray         # 当前步骤（0..3N-1）
+    # 由 MCTS recurrent_fn 在该节点处执行的若干次 rollout 中挑出的最优终态。
+    # roll_value = -hpwl；为 -inf 表示该节点尚未做过 rollout（例如 root）。
+    roll_s1: jnp.ndarray
+    roll_s2: jnp.ndarray
+    roll_ori: jnp.ndarray
+    roll_value: jnp.ndarray
 
 
 class StateManager:
@@ -27,6 +33,10 @@ class StateManager:
             s2=jnp.full(num_movable, -1, dtype=jnp.int32),
             orientations=jnp.full(num_movable, -1, dtype=jnp.int32),
             step=jnp.array(0, dtype=jnp.int32),
+            roll_s1=jnp.full(num_movable, -1, dtype=jnp.int32),
+            roll_s2=jnp.full(num_movable, -1, dtype=jnp.int32),
+            roll_ori=jnp.full(num_movable, -1, dtype=jnp.int32),
+            roll_value=jnp.array(-jnp.inf, dtype=jnp.float32),
         )
     
     @staticmethod

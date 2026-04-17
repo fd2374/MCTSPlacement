@@ -50,8 +50,8 @@ class MCTSPlacer:
         logits = jnp.where(valid_mask, 0.0, -1e9)
         return logits
 
-    def _single_rollout(self, state: PlacementState, rng_key) -> jnp.ndarray:
-        """单次 rollout 到终态并返回奖励"""
+    def _single_rollout(self, state: PlacementState, rng_key):
+        """单次 rollout 到终态，返回 (leaf_state, reward)。"""
         def cond(a):
             state, key = a
             return state.step < 3 * self.num_movable
@@ -63,20 +63,22 @@ class MCTSPlacer:
             state = self.state_manager.apply_action(state, action, self.num_movable, self.sorted_modules)
             return state, key
             
-        leaf, key = jax.lax.while_loop(cond, step, (state, rng_key))
-        return self.compute_reward(leaf)
+        leaf, _ = jax.lax.while_loop(cond, step, (state, rng_key))
+        return leaf, self.compute_reward(leaf)
 
-    def rollout(self, state: PlacementState, rng_key, n_rollouts: int = 256) -> jnp.ndarray:
-        """K 次并行 rollout 取最大值（= 最低 HPWL）。
+    def rollout(self, state: PlacementState, rng_key, n_rollouts: int = 256):
+        """K 次并行 rollout 取最大值（= 最低 HPWL），同时返回最优 leaf。
 
-        这里目标是 max-over-samples（找到最好的布局），而非估计随机策略下的期望
-        回报，因此使用 max 聚合：每个节点的 value 表示"该子树已观测到的最佳可达
-        reward"。n_rollouts 越大，这个上界估计越紧，对 Sequential Halving 和
-        PUCT 选择都更有利。
+        - value：max over samples，用作 MCTS 节点的上界估计。
+        - best_leaf：对应最优 reward 的那次 rollout 的终态 (s1, s2, orientations)，
+          之后写入到子节点 embedding 的 roll_* 字段，供后处理候选池复用。
         """
         keys = jax.random.split(rng_key, n_rollouts)
-        values = jax.vmap(lambda k: self._single_rollout(state, k))(keys)
-        return jnp.max(values)
+        leaves, values = jax.vmap(lambda k: self._single_rollout(state, k))(keys)
+        best_idx = jnp.argmax(values)
+        best_value = values[best_idx]
+        best_leaf = jax.tree_util.tree_map(lambda x: x[best_idx], leaves)
+        return best_value, best_leaf
     
     def compute_reward(self, state: PlacementState) -> jnp.ndarray:
         """计算奖励（仅在终端状态）"""
@@ -114,9 +116,20 @@ class MCTSPlacer:
             # 计算奖励
             reward = self.compute_reward(new_state)
             
+            # 从 new_state 出发做 rollout，拿到最优 value 以及对应的终态 leaf。
+            best_value, best_leaf = self.rollout(new_state, rng_key)
+            
+            # 把最优 rollout leaf 挂到当前节点的 embedding，作为后处理候选之一。
+            new_state = new_state._replace(
+                roll_s1=best_leaf.s1,
+                roll_s2=best_leaf.s2,
+                roll_ori=best_leaf.orientations,
+                roll_value=best_value,
+            )
+            
             return mctx.RecurrentFnOutput(
                 prior_logits=self.policy_function(new_state),
-                value=self.rollout(new_state, rng_key),
+                value=best_value,
                 reward=reward,
                 discount=jnp.where(is_terminal, 0.0, 1.0),
             ), new_state

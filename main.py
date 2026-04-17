@@ -92,38 +92,31 @@ class PlacementRunner:
         return policy_output
 
     def _extract_per_batch_best(self, tree, chunk_size=1024):
-        """对每个 batch 取其"最优合法终端节点"（HPWL 最低且不越界）。
+        """对每个 batch 取其"最优合法终端候选"（HPWL 最低且不越界）。
 
-        做法：对全部 (B, N) 节点分块跑 compute_final_positions，对每个节点
-        检查是否所有 movable 都在 interposer 边界内，越界的 value 置 -inf 后
-        再 argmax。这样能捡回那些"全局最低但越界"导致的漏解问题。
-
-        分块是为了避免 B*N 全量一次性 vmap 时把 pins_dx/pdy 等中间数组全部
-        常驻显存（apte/xerox 规模 ~2.6GB，会 OOM）。
+        候选来自两个来源：
+          A) tree 中已落地的终端节点（step == 3N）；
+          B) 每个 MCTS 节点在 recurrent_fn 里跑 rollout 时保留下来的最优终态
+             （存在 embedding.roll_* 中，roll_value>-inf 时有效）。
+        二者合并后再做合法性过滤。分块 bounds check 避免 pins_dx/pdy 中间数组
+        常驻显存导致 OOM。
 
         返回：
-          states: PlacementState，shape (B,)
-          hpwls:  (B,) 每个 batch 的最优合法 HPWL（+inf 表示该 batch 无合法终端）
-          node_indices: (B,) 每个 batch 最优合法终端节点在 tree 中的 node 下标
+          states:           PlacementState，shape (B,) —— 选中的状态
+          hpwls:            (B,) 最优合法 HPWL（+inf 表示无合法解）
+          node_indices:     (B,) 选中候选对应的 tree 节点下标（若来源于 rollout
+                             leaf，则是发起 rollout 的父节点，供 GIF 高亮用）
+          from_rollout:     (B,) 布尔，表示选中候选是否来自 rollout leaf
         """
         target_step = 3 * self.num_movable
-        terminal_mask = tree.embeddings.step == target_step  # (B, N)
+        emb = tree.embeddings
+        terminal_mask = emb.step == target_step  # (B, N)
         B, N = terminal_mask.shape
-
-        s1 = tree.embeddings.s1  # (B, N, M)
-        s2 = tree.embeddings.s2
-        ori = tree.embeddings.orientations
-        M = s1.shape[-1]
-        total = B * N
-
-        flat_s1 = s1.reshape(total, M)
-        flat_s2 = s2.reshape(total, M)
-        flat_ori = ori.reshape(total, M)
+        M = emb.s1.shape[-1]
 
         mi = jnp.array(self.movable_indices)
         bw = jnp.float32(self.boundary_width)
         bh = jnp.float32(self.boundary_height)
-
         compute_final = self.placer.placement_solver.compute_final_positions
 
         @jax.jit
@@ -137,46 +130,81 @@ class PlacementRunner:
                 jnp.all(y[:, mi] + h[:, mi] <= bh, axis=1)
             )
 
-        # Padding 到 chunk_size 整数倍，保证每块 shape 固定不触发重编译
-        pad = (-total) % chunk_size
-        if pad > 0:
-            flat_s1 = jnp.concatenate([flat_s1, jnp.zeros((pad, M), dtype=flat_s1.dtype)])
-            flat_s2 = jnp.concatenate([flat_s2, jnp.zeros((pad, M), dtype=flat_s2.dtype)])
-            flat_ori = jnp.concatenate([flat_ori, jnp.zeros((pad, M), dtype=flat_ori.dtype)])
+        def _bounds_check(s1, s2, ori):
+            """(B, N, M) -> (B, N) 合法掩码，走分块 vmap 控显存。"""
+            total = B * N
+            flat_s1 = s1.reshape(total, M)
+            flat_s2 = s2.reshape(total, M)
+            flat_ori = ori.reshape(total, M)
+            pad = (-total) % chunk_size
+            if pad > 0:
+                flat_s1 = jnp.concatenate([flat_s1, jnp.zeros((pad, M), dtype=flat_s1.dtype)])
+                flat_s2 = jnp.concatenate([flat_s2, jnp.zeros((pad, M), dtype=flat_s2.dtype)])
+                flat_ori = jnp.concatenate([flat_ori, jnp.zeros((pad, M), dtype=flat_ori.dtype)])
+            padded_total = total + pad
+            parts = []
+            for start in range(0, padded_total, chunk_size):
+                end = start + chunk_size
+                parts.append(check_chunk(
+                    flat_s1[start:end], flat_s2[start:end], flat_ori[start:end]))
+            return jnp.concatenate(parts)[:total].reshape(B, N)
 
-        padded_total = total + pad
-        parts = []
-        for start in range(0, padded_total, chunk_size):
-            end = start + chunk_size
-            parts.append(check_chunk(
-                flat_s1[start:end], flat_s2[start:end], flat_ori[start:end]))
-        in_bounds_flat = jnp.concatenate(parts)[:total]
-        in_bounds = in_bounds_flat.reshape(B, N)
+        # 源 A：节点自身（仅 terminal 才算）
+        in_bounds_A = _bounds_check(emb.s1, emb.s2, emb.orientations)
+        val_A = jnp.where(terminal_mask & in_bounds_A, tree.node_values, -jnp.inf)
 
-        valid_mask = terminal_mask & in_bounds
-        masked_values = jnp.where(valid_mask, tree.node_values, -jnp.inf)
+        # 源 B：每节点 rollout best leaf。
+        # 注意 mctx 把 tree embeddings 全体用 jnp.zeros 初始化，所以"未被访问节点"的
+        # roll_value=0；root 节点 roll_value=-inf（来自 initial_state）。真实 rollout
+        # 写入的 reward 是 -hpwl 严格 <0 且有限，所以用 isfinite & <0 精确过滤。
+        roll_valid = jnp.isfinite(emb.roll_value) & (emb.roll_value < 0)
+        in_bounds_B = _bounds_check(emb.roll_s1, emb.roll_s2, emb.roll_ori)
+        val_B = jnp.where(roll_valid & in_bounds_B, emb.roll_value, -jnp.inf)
 
-        best_node_per_batch = jnp.argmax(masked_values, axis=1)
-        best_value_per_batch = jnp.max(masked_values, axis=1)
+        # 每个 (batch, node) 取两源较优者
+        use_roll = val_B > val_A
+        per_node_val = jnp.maximum(val_A, val_B)
 
-        batch_indices = jnp.arange(B)
+        best_node_per_batch = jnp.argmax(per_node_val, axis=1)
+        best_value_per_batch = jnp.max(per_node_val, axis=1)
+
+        ba = jnp.arange(B)
+        best_use_roll = use_roll[ba, best_node_per_batch]  # (B,)
+
+        # 按来源挑 s1/s2/ori
+        sel_s1 = jnp.where(best_use_roll[:, None],
+                           emb.roll_s1[ba, best_node_per_batch],
+                           emb.s1[ba, best_node_per_batch])
+        sel_s2 = jnp.where(best_use_roll[:, None],
+                           emb.roll_s2[ba, best_node_per_batch],
+                           emb.s2[ba, best_node_per_batch])
+        sel_ori = jnp.where(best_use_roll[:, None],
+                            emb.roll_ori[ba, best_node_per_batch],
+                            emb.orientations[ba, best_node_per_batch])
+
         states = PlacementState(
-            s1=s1[batch_indices, best_node_per_batch],
-            s2=s2[batch_indices, best_node_per_batch],
-            orientations=ori[batch_indices, best_node_per_batch],
-            step=tree.embeddings.step[batch_indices, best_node_per_batch],
+            s1=sel_s1, s2=sel_s2, orientations=sel_ori,
+            step=jnp.full((B,), target_step, dtype=jnp.int32),
+            # 后续不再使用 roll_* 字段，这里填占位值即可
+            roll_s1=sel_s1, roll_s2=sel_s2, roll_ori=sel_ori,
+            roll_value=best_value_per_batch,
         )
         hpwls = jnp.where(best_value_per_batch > -jnp.inf,
                           -best_value_per_batch, jnp.inf)
 
+        # 统计
+        num_tree_terms = int(jnp.sum(terminal_mask))
+        num_tree_valid = int(jnp.sum(terminal_mask & in_bounds_A))
+        num_roll_valid = int(jnp.sum(roll_valid & in_bounds_B))
         num_no_valid = int(jnp.sum(best_value_per_batch == -jnp.inf))
-        num_terminals = int(jnp.sum(terminal_mask))
-        num_valid_terminals = int(jnp.sum(valid_mask))
+        num_from_roll = int(jnp.sum(best_use_roll & (best_value_per_batch > -jnp.inf)))
         best_hpwl = float(jnp.min(hpwls))
-        print(f"  终端节点: {num_valid_terminals}/{num_terminals} 合法 "
-              f"（{B - num_no_valid}/{B} 个 batch 找到合法解）")
+        print(f"  候选池: tree 终端 {num_tree_valid}/{num_tree_terms} 合法 | "
+              f"rollout leaves {num_roll_valid} 合法")
+        print(f"  {B - num_no_valid}/{B} 个 batch 找到合法解；"
+              f"其中 {num_from_roll} 来自 rollout leaf")
         print(f"  最低合法 HPWL: {best_hpwl:.2f}")
-        return states, hpwls, best_node_per_batch
+        return states, hpwls, best_node_per_batch, best_use_roll
     
     def _calc_boundary_from_terminals(self):
         """从terminal节点计算interposer边界"""
@@ -273,9 +301,9 @@ def main():
     
     runner.save_tree(policy_output)
     
-    # 提取每个 batch 的最优合法终端状态（越界的自动跳过）+ 其所在 node index
-    per_batch_states, per_batch_hpwls, per_batch_node = runner._extract_per_batch_best(
-        policy_output.search_tree)
+    # 提取每个 batch 的最优合法候选（tree 终端 ∪ rollout leaves，越界的自动跳过）
+    per_batch_states, per_batch_hpwls, per_batch_node, per_batch_from_roll = \
+        runner._extract_per_batch_best(policy_output.search_tree)
     B = int(per_batch_hpwls.shape[0])
 
     all_x, all_y, all_w, all_h, all_pdx, all_pdy = jax.vmap(
@@ -284,7 +312,7 @@ def main():
 
     # _extract_per_batch_best 已经过滤过越界解，这里只需按 HPWL 升序取 top-K
     num_valid = int(jnp.sum(per_batch_hpwls < jnp.inf))
-    top_k = min(config.batch_size // 5 + 1, max(num_valid, 1))
+    top_k = min(config.batch_size, max(num_valid, 1))
     # batch_of_cand[i] = 候选 i 来自哪个 batch（全局 batch index），
     # 配合 per_batch_node 可直接定位到 tree 中对应终端节点
     batch_of_cand = jnp.argsort(per_batch_hpwls)[:top_k]
@@ -354,9 +382,11 @@ def main():
         # 最优解对应的 MCTS 源 (batch 索引 + 树内 node 索引)
         origin_batch = int(batch_of_cand[trace_idx])
         origin_node = int(per_batch_node[origin_batch])
+        origin_from_roll = bool(per_batch_from_roll[origin_batch])
         winning_ord = int(all_best_ord[trace_idx])
         labels = optimizer.ordering_labels(len(orderings))
-        print(f"  最优解来自 batch {origin_batch} 的 node {origin_node}，"
+        src_label = "rollout leaf" if origin_from_roll else "tree terminal"
+        print(f"  最优解来自 batch {origin_batch} 的 node {origin_node} ({src_label})，"
               f"使用 ordering {winning_ord} [{labels[winning_ord]}]")
 
         create_mcts_gif(
