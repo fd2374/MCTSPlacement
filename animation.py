@@ -1,4 +1,10 @@
-"""动画模块 - 生成三个阶段的算法演示GIF"""
+"""动画模块 - 生成 MCTS 搜索 + 后处理退火两个阶段的演示 GIF。
+
+两份 GIF 都严格绑定到"最终被选中的最优解"：
+  * create_mcts_gif: 展示最优解所在 batch 的搜索树，并在结束时高亮获胜终端节点
+  * create_sa_gif:   使用 optimize_batch 选中的那个 ordering 重放真正的
+                     merged annealing 过程（整体平移 + 方向·位置联合 sweep）
+"""
 from __future__ import annotations
 
 import io
@@ -19,11 +25,12 @@ from post_optimizer import PostOptimizer
 
 def _draw_placement(ax, bench, x, y, w, h, movable_indices, bw, bh,
                     highlight=None, ghosts=None):
-    """highlight: set of indices to show in gold. ghosts: [(idx, old_x, old_y), ...]."""
+    """highlight: iterable of indices to show in gold.
+    ghosts: [(idx, old_x, old_y), ...] 以虚线框显示上一帧的位置。"""
     x_np, y_np = np.asarray(x), np.asarray(y)
     w_np, h_np = np.asarray(w), np.asarray(h)
     mi_set = set(int(i) for i in np.asarray(movable_indices))
-    hl = highlight or set()
+    hl = set(int(i) for i in (highlight or []))
 
     if ghosts:
         for idx, gx, gy in ghosts:
@@ -82,13 +89,6 @@ def _save_gif(frames, path, fps):
     print(f"  GIF: {path} ({len(uniform)} frames, {fps}fps)")
 
 
-def _get_boundary(bench):
-    tm = np.array(bench.is_terminal) == 1
-    bw = float(np.max(np.where(tm, np.array(bench.x_fixed) + np.array(bench.widths), 0)))
-    bh = float(np.max(np.where(tm, np.array(bench.y_fixed) + np.array(bench.heights), 0)))
-    return bw, bh
-
-
 # ======================== Tree Layout ========================
 
 def _tree_layout(children_index_np, num_nodes):
@@ -121,37 +121,65 @@ def _tree_layout(children_index_np, num_nodes):
     return positions, children
 
 
+def _path_to_root(parents_np, node):
+    """返回 node -> root 的 node 索引集合（含 node 自身）。parents[0] 应为 -1/0。"""
+    seen = set()
+    cur = int(node)
+    guard = 0
+    while 0 <= cur < parents_np.shape[0] and cur not in seen:
+        seen.add(cur)
+        nxt = int(parents_np[cur])
+        if nxt == cur or nxt < 0:
+            break
+        cur = nxt
+        guard += 1
+        if guard > parents_np.shape[0]:
+            break
+    return seen
+
+
 # ======================== Stage 1: MCTS GIF ========================
 
-def create_mcts_gif(tree, placer, num_movable, batch_idx, output_path,
-                    target_frames=30, fps=3, final_placement=None,
+def create_mcts_gif(tree, placer, num_movable, batch_idx, target_node,
+                    output_path, target_frames=30, fps=3,
                     boundary_wh=None):
+    """绘制最优解所在 batch 的 MCTS 搜索树及其 best-so-far 布局演变。
+
+    Args:
+        tree: mctx 输出的搜索树（含 batch 维）
+        placer: MCTSPlacer 实例（用于反算坐标）
+        num_movable: 可移动模块数
+        batch_idx: 最优解所在的 batch 下标
+        target_node: 最优解在该 batch 的搜索树中的 node 下标
+        boundary_wh: (bw, bh)，interposer 边界
+    """
     t0 = time.time()
-    print("  [MCTS GIF] 开始...", flush=True)
+    print(f"  [MCTS GIF] 开始 (batch={batch_idx}, target_node={target_node})...", flush=True)
     num_sims = tree.num_simulations
     num_nodes = num_sims + 1
-    target = 3 * num_movable
+    target_step = 3 * num_movable
 
-    print(f"  [MCTS GIF] 提取树数据 ({num_nodes} nodes)...", flush=True)
     ci = np.array(tree.children_index[batch_idx])
+    parents = np.array(tree.parents[batch_idx]) if hasattr(tree, 'parents') else None
     vals = np.array(tree.node_values[batch_idx])
     vis = np.array(tree.node_visits[batch_idx])
     steps = np.array(tree.embeddings.step[batch_idx])
-    print(f"  [MCTS GIF] 提取完成 ({time.time()-t0:.1f}s)", flush=True)
 
     print("  [MCTS GIF] 计算树布局...", flush=True)
     pos, _ = _tree_layout(ci, num_nodes)
-    print(f"  [MCTS GIF] 树布局完成 ({time.time()-t0:.1f}s)", flush=True)
 
     bench = placer.bench
     mi = np.array(placer.movable_indices)
-    if boundary_wh is not None:
-        bw, bh = boundary_wh
-    else:
-        bw, bh = _get_boundary(bench)
+    bw, bh = boundary_wh if boundary_wh is not None else (
+        float(np.max(np.where(np.array(bench.is_terminal) == 1,
+                              np.array(bench.x_fixed) + np.array(bench.widths), 0))),
+        float(np.max(np.where(np.array(bench.is_terminal) == 1,
+                              np.array(bench.y_fixed) + np.array(bench.heights), 0))),
+    )
 
+    # 批量计算所有终端节点的布局 + HPWL
     terminal_data = {}
-    term_indices = np.where(steps == target)[0]
+    term_indices = np.where(steps == target_step)[0]
     print(f"  [MCTS GIF] 找到 {len(term_indices)} 个终端节点, 批量计算布局...", flush=True)
     if len(term_indices) > 0:
         t_s1 = tree.embeddings.s1[batch_idx][term_indices]
@@ -165,7 +193,10 @@ def create_mcts_gif(tree, placer, num_movable, batch_idx, output_path,
         )(t_px, t_py, t_pw, t_ph, t_pdx, t_pdy)
         for i, ni in enumerate(term_indices):
             terminal_data[int(ni)] = (t_px[i], t_py[i], t_pw[i], t_ph[i], float(t_hpwl[i]))
-    print(f"  [MCTS GIF] 终端布局计算完成 ({time.time()-t0:.1f}s)", flush=True)
+
+    target_node = int(target_node)
+    target_path = (_path_to_root(parents, target_node)
+                   if parents is not None and target_node in pos else {target_node})
 
     vv = vals[vis > 0]
     vmin, vmax = (float(vv.min()), float(vv.max())) if len(vv) else (-1.0, 0.0)
@@ -174,10 +205,7 @@ def create_mcts_gif(tree, placer, num_movable, batch_idx, output_path,
     norm = Normalize(vmin=vmin, vmax=vmax)
     cmap = plt.cm.RdYlGn
 
-    # Precompute edges: (reveal_time, segment) sorted by reveal_time
-    print("  [MCTS GIF] 预计算边...", flush=True)
-    edge_times = []
-    edge_segs = []
+    edge_times, edge_segs = [], []
     for p in range(ci.shape[0]):
         px_t, py_t = pos.get(p, (0, 0))
         for a in range(ci.shape[1]):
@@ -189,7 +217,6 @@ def create_mcts_gif(tree, placer, num_movable, batch_idx, output_path,
     edge_times = np.array(edge_times)[order]
     edge_segs = [edge_segs[i] for i in order]
 
-    # Precompute node data sorted by node index
     node_ids, node_xy, node_sz, node_val = [], [], [], []
     for ni in range(num_nodes):
         if vis[ni] <= 0 and ni > 0:
@@ -210,20 +237,25 @@ def create_mcts_gif(tree, placer, num_movable, batch_idx, output_path,
 
     print(f"  [MCTS GIF] 渲染 {len(idxs)} 帧 (step={frame_step})...", flush=True)
     frames = []
+    winning_revealed_at = None  # 最优终端节点首次出现的帧
     for fi, t in enumerate(idxs):
         fig, (ax_t, ax_p) = plt.subplots(1, 2, figsize=(16, 8))
 
-        # Edges: binary search for visible subset
         n_vis_edges = int(np.searchsorted(edge_times, t, side='right'))
         if n_vis_edges > 0:
             ax_t.add_collection(LineCollection(
                 edge_segs[:n_vis_edges], colors='#CCCCCC', linewidths=0.7, zorder=1))
 
-        # Nodes: mask by index <= t, single scatter call
         mask = node_ids <= t
         if mask.any():
-            ec = np.where((node_ids[mask] == t) & (t > 0), '#FF3333', '#555555')
-            ew = np.where((node_ids[mask] == t) & (t > 0), 2.0, 0.4)
+            on_winning_path = np.isin(node_ids[mask], list(target_path))
+            just_added = (node_ids[mask] == t) & (t > 0)
+            ec = np.where(on_winning_path & (node_ids[mask] == target_node) & (t >= target_node),
+                          '#FF1493',
+                          np.where(on_winning_path & (t >= target_node), '#FF8C00',
+                                   np.where(just_added, '#FF3333', '#555555')))
+            ew = np.where(on_winning_path & (t >= target_node), 2.2,
+                          np.where(just_added, 2.0, 0.4))
             ax_t.scatter(node_xy[mask, 0], node_xy[mask, 1],
                         s=node_sz[mask], c=node_colors[mask],
                         edgecolors=ec, linewidths=ew, zorder=2)
@@ -235,37 +267,37 @@ def create_mcts_gif(tree, placer, num_movable, batch_idx, output_path,
             sp.set_visible(False)
         ax_t.autoscale_view()
 
-        is_last = (fi == len(idxs) - 1)
-        if is_last and final_placement is not None:
-            fx, fy, fw, fh, fpdx, fpdy = final_placement
-            fhpwl = float(PostOptimizer._compute_hpwl_direct(
-                fx, fy, fw, fh, bench.nets_ptr, bench.pins_nodes, fpdx, fpdy))
-            _draw_placement(ax_p, bench, fx, fy, fw, fh, mi, bw, bh)
-            ax_p.set_title(f'Best Placement  HPWL={fhpwl:.0f}', fontsize=13)
+        # 右侧面板：已揭示的最优终端对应布局
+        best_n, best_v = None, -np.inf
+        for ni in terminal_data:
+            if ni <= t and vals[ni] > best_v:
+                best_v, best_n = vals[ni], ni
+        if best_n is not None:
+            px, py, pw, ph, hpwl = terminal_data[best_n]
+            tag = ' [WINNER]' if best_n == target_node else ''
+            _draw_placement(ax_p, bench, px, py, pw, ph, mi, bw, bh)
+            ax_p.set_title(
+                f'Best Placement{tag}  HPWL={hpwl:.0f}  (node {best_n})',
+                fontsize=13)
+            if winning_revealed_at is None and best_n == target_node:
+                winning_revealed_at = t
         else:
-            best_n, best_v = None, -np.inf
-            for ni in terminal_data:
-                if ni <= t and vals[ni] > best_v:
-                    best_v, best_n = vals[ni], ni
-            if best_n is not None:
-                px, py, pw, ph, hpwl = terminal_data[best_n]
-                _draw_placement(ax_p, bench, px, py, pw, ph, mi, bw, bh)
-                ax_p.set_title(f'Best Placement  HPWL={hpwl:.0f}', fontsize=13)
-            else:
-                ax_p.text(0.5, 0.5, 'Searching...', transform=ax_p.transAxes,
-                         ha='center', va='center', fontsize=22, color='#999999')
-                ax_p.set_xlim(0, bw)
-                ax_p.set_ylim(0, bh)
-                ax_p.set_aspect('equal')
-                ax_p.set_title('Best Placement', fontsize=13)
+            ax_p.text(0.5, 0.5, 'Searching...', transform=ax_p.transAxes,
+                     ha='center', va='center', fontsize=22, color='#999999')
+            ax_p.set_xlim(0, bw)
+            ax_p.set_ylim(0, bh)
+            ax_p.set_aspect('equal')
+            ax_p.set_title('Best Placement', fontsize=13)
 
-        fig.suptitle(f'Stage 1: MCTS Search  (Sim {t}/{num_sims})', fontsize=15, y=0.98)
+        suffix = f'  winner @ sim {winning_revealed_at}' if winning_revealed_at is not None else ''
+        fig.suptitle(f'Stage 1: MCTS Search  (batch {batch_idx}, Sim {t}/{num_sims}){suffix}',
+                     fontsize=15, y=0.98)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         frames.append(_fig_to_pil(fig))
         if (fi + 1) % 5 == 0 or fi == len(idxs) - 1:
             print(f"  [MCTS GIF] 帧 {fi+1}/{len(idxs)} ({time.time()-t0:.1f}s)", flush=True)
 
-    for _ in range(3):
+    for _ in range(4):
         frames.append(frames[-1].copy())
     print(f"  [MCTS GIF] 保存GIF...", flush=True)
     _save_gif(frames, output_path, fps)
@@ -274,212 +306,125 @@ def create_mcts_gif(tree, placer, num_movable, batch_idx, output_path,
 
 # ======================== Stage 2: SA GIF ========================
 
-def create_sa_gif(optimizer, init_x, init_y, w, h, pdx, pdy,
-                  bench, bw, bh, search_points, num_phases,
-                  output_path, fps=2,
-                  target_x=None, target_y=None,
-                  target_w=None, target_h=None,
-                  target_pdx=None, target_pdy=None):
-    t0 = time.time()
-    print("  [SA GIF] 开始...", flush=True)
-    opt_x = jnp.array(init_x, dtype=jnp.float32)
-    opt_y = jnp.array(init_y, dtype=jnp.float32)
-    widths, heights = jnp.array(w), jnp.array(h)
-    p_dx, p_dy = jnp.array(pdx), jnp.array(pdy)
+def create_sa_gif(optimizer, bench,
+                  init_x, init_y, init_w, init_h, init_pdx, init_pdy,
+                  mi_order, ord_label,
+                  bw, bh, search_points, num_phases,
+                  output_path, fps=2):
+    """重放 optimize_batch 为选中候选所选的那一条 merged annealing 轨迹。
 
-    mi_all = optimizer.movable_indices
+    每个 phase 内部分两步：
+      (1) 整体平移：把 movable 集群作为刚体搬到更优位置（单帧）
+      (2) 方向+位置联合 sweep：对每个模块做 4 方向 + 本地 offset 网格搜索（单帧）
+    因此帧数 ≈ 1 (初始) + 2 * num_phases + 1 (final)。
+    """
+    t0 = time.time()
+    print(f"  [SA GIF] 开始 (ordering='{ord_label}', {num_phases} phases)...", flush=True)
+
+    ox = jnp.array(init_x, dtype=jnp.float32)
+    oy = jnp.array(init_y, dtype=jnp.float32)
+    w = jnp.array(init_w, dtype=jnp.float32)
+    h = jnp.array(init_h, dtype=jnp.float32)
+    pdx = jnp.array(init_pdx, dtype=jnp.float32)
+    pdy = jnp.array(init_pdy, dtype=jnp.float32)
+
     bw_j, bh_j = jnp.float32(bw), jnp.float32(bh)
-    init_step = float(max(bw, bh) // search_points)
+    initial_step = float(max(bw, bh) // search_points)
     final_step = 1.0
     base_ox, base_oy = optimizer._make_offsets(search_points)
 
-    print(f"  [SA GIF] 尝试5种排序, 选取最优...", flush=True)
-    orderings = [optimizer.movable_indices_asc, optimizer.movable_indices_desc]
-    rng = jax.random.PRNGKey(0)
-    for _ in range(3):
-        rng, subkey = jax.random.split(rng)
-        orderings.append(jax.random.permutation(subkey, optimizer.movable_indices_asc))
-    labels = ["面积↑", "面积↓", "随机1", "随机2", "随机3"]
-    best_mi = orderings[0]
-    best_h = float('inf')
-    for oi, mi_order in enumerate(orderings):
-        rx, ry = PostOptimizer._full_annealing(
-            opt_x, opt_y, widths, heights,
-            mi_order, bw_j, bh_j,
-            bench.nets_ptr, bench.pins_nodes, p_dx, p_dy,
-            jnp.int32(num_phases), jnp.float32(init_step), jnp.float32(final_step),
-            base_ox, base_oy)
-        h_val = float(PostOptimizer._compute_hpwl_direct(
-            rx, ry, widths, heights, bench.nets_ptr, bench.pins_nodes, p_dx, p_dy))
-        tag = " ← best" if h_val < best_h else ""
-        print(f"    排序 {labels[oi]}: HPWL={h_val:.0f}{tag}", flush=True)
-        if h_val < best_h:
-            best_h = h_val
-            best_mi = mi_order
-    mi = best_mi
+    mi_all = jnp.array(optimizer.movable_indices)
+    mi_order = jnp.array(mi_order)
+    base_w = jnp.array(bench.widths)
+    base_h = jnp.array(bench.heights)
+    base_pdx = jnp.array(bench.pins_dx)
+    base_pdy = jnp.array(bench.pins_dy)
 
-    gif_phases = max(num_phases * 4, 15)
-    print(f"  [SA GIF] {gif_phases} phases, {len(mi)} modules", flush=True)
-
-    def compute_hpwl():
+    def compute_hpwl(x_, y_, w_, h_, pdx_, pdy_):
         return float(PostOptimizer._compute_hpwl_direct(
-            opt_x, opt_y, widths, heights,
-            bench.nets_ptr, bench.pins_nodes, p_dx, p_dy))
+            x_, y_, w_, h_, bench.nets_ptr, bench.pins_nodes, pdx_, pdy_))
 
-    def snap(title, hl=None, ghost_list=None):
+    def snap(title, x_, y_, w_, h_, pdx_, pdy_, hl=None, ghost_list=None):
         fig, ax = plt.subplots(figsize=(10, 10))
-        _draw_placement(ax, bench, opt_x, opt_y, widths, heights, mi_all, bw, bh,
-                       highlight=hl, ghosts=ghost_list)
-        ax.set_title(title, fontsize=12 if hl else 13)
-        fig.suptitle('Stage 2: SA Post-Optimization', fontsize=15, y=0.98)
+        _draw_placement(ax, bench, x_, y_, w_, h_, mi_all, bw, bh,
+                        highlight=hl, ghosts=ghost_list)
+        ax.set_title(title, fontsize=12)
+        fig.suptitle(f'Stage 2: Merged Annealing  [ordering={ord_label}]',
+                     fontsize=15, y=0.98)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         return _fig_to_pil(fig)
 
     print(f"  [SA GIF] 渲染初始帧...", flush=True)
-    frames = [snap(f'Initial  HPWL={compute_hpwl():.0f}')]
+    frames = [snap(f'Initial  HPWL={compute_hpwl(ox, oy, w, h, pdx, pdy):.0f}',
+                   ox, oy, w, h, pdx, pdy)]
 
-    for phase in range(gif_phases):
-        t = phase / max(1, gif_phases - 1)
-        ratio = final_step / max(init_step, final_step)
-        cur_step = init_step * ratio ** t
+    for phase in range(num_phases):
+        t_frac = phase / max(1, num_phases - 1)
+        ratio = final_step / max(initial_step, final_step)
+        cur_step = initial_step * ratio ** t_frac
         offsets_x = base_ox * cur_step
         offsets_y = base_oy * cur_step
 
-        print(f"  [SA GIF] sweep {phase+1}/{gif_phases} (step={cur_step:.0f})...", end="", flush=True)
-        prev_x, prev_y = np.array(opt_x), np.array(opt_y)
-        opt_x, opt_y = PostOptimizer._sweep_modules(
-            opt_x, opt_y, widths, heights,
-            mi, offsets_x, offsets_y, bw_j, bh_j,
-            bench.nets_ptr, bench.pins_nodes, p_dx, p_dy)
-
-        cur_x, cur_y = np.array(opt_x), np.array(opt_y)
-        moved = []
-        for i in range(len(mi)):
-            idx = int(mi[i])
-            dist = abs(cur_x[idx] - prev_x[idx]) + abs(cur_y[idx] - prev_y[idx])
-            if dist > 0.1:
-                moved.append((idx, dist, prev_x[idx], prev_y[idx]))
-
-        hpwl = compute_hpwl()
-        print(f" {len(moved)} moved, HPWL={hpwl:.0f} ({time.time()-t0:.1f}s)", flush=True)
-        if moved:
-            moved.sort(key=lambda x: -x[1])
-            hl_set = {m[0] for m in moved}
-            ghost_top = [(m[0], m[2], m[3]) for m in moved[:5]]
-            title = (f'Phase {phase+1}/{gif_phases}  Step={cur_step:.0f}  '
-                     f'{len(moved)} moved  HPWL={hpwl:.0f}')
-            frames.append(snap(title, hl=hl_set, ghost_list=ghost_top))
-
-    if target_x is not None:
-        opt_x = jnp.array(target_x)
-        opt_y = jnp.array(target_y)
-        if target_w is not None:
-            widths = jnp.array(target_w)
-            heights = jnp.array(target_h)
-            p_dx = jnp.array(target_pdx)
-            p_dy = jnp.array(target_pdy)
-    print(f"  [SA GIF] 保存GIF ({len(frames)} frames)...", flush=True)
-    final_hpwl = compute_hpwl()
-    print(f"  [SA GIF] Final HPWL={final_hpwl:.0f}", flush=True)
-    final = snap(f'Final  HPWL={final_hpwl:.0f}')
-    for _ in range(4):
-        frames.append(final.copy())
-    _save_gif(frames, output_path, fps)
-    print(f"  [SA GIF] 完成 ({time.time()-t0:.1f}s)", flush=True)
-
-
-# ======================== Stage 3: Orientation GIF ========================
-
-def create_orientation_gif(optimizer, init_x, init_y, init_w, init_h,
-                           init_pdx, init_pdy, bench, bw, bh,
-                           search_points, annealing_phases,
-                           output_path, fps=2, max_rounds=20):
-    t0 = time.time()
-    print(f"  [ORI GIF] 开始 (max {max_rounds} rounds)...", flush=True)
-    bw_j, bh_j = jnp.float32(bw), jnp.float32(bh)
-    initial_step = jnp.float32(max(bw, bh) // search_points)
-    base_ox, base_oy = optimizer._make_offsets(search_points)
-
-    x_cands = jnp.arange(0, float(bw) + 1, 1.0)
-    y_cands = jnp.arange(0, float(bh) + 1, 1.0)
-    base_w, base_h = jnp.array(bench.widths), jnp.array(bench.heights)
-    base_pdx, base_pdy = jnp.array(bench.pins_dx), jnp.array(bench.pins_dy)
-
-    mi_desc = optimizer.movable_indices_desc
-    mi_all = jnp.array(optimizer.movable_indices)
-
-    ox, oy = jnp.array(init_x), jnp.array(init_y)
-    cw, ch = jnp.array(init_w), jnp.array(init_h)
-    cpdx, cpdy = jnp.array(init_pdx), jnp.array(init_pdy)
-
-    def compute_hpwl():
-        return float(PostOptimizer._compute_hpwl_direct(
-            ox, oy, cw, ch, bench.nets_ptr, bench.pins_nodes, cpdx, cpdy))
-
-    def snap(title, hl=None):
-        fig, ax = plt.subplots(figsize=(10, 10))
-        _draw_placement(ax, bench, ox, oy, cw, ch, mi_all, bw, bh, highlight=hl)
-        ax.set_title(title, fontsize=12)
-        fig.suptitle('Stage 3: Orientation Optimization', fontsize=15, y=0.98)
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
-        return _fig_to_pil(fig)
-
-    print(f"  [ORI GIF] 渲染初始帧...", flush=True)
-    frames = [snap(f'Initial  HPWL={compute_hpwl():.0f}')]
-
-    for rd in range(max_rounds):
-        hpwl_before = compute_hpwl()
-        prev_w, prev_h = np.array(cw), np.array(ch)
         prev_x, prev_y = np.array(ox), np.array(oy)
+        prev_w, prev_h = np.array(w), np.array(h)
 
-        print(f"  [ORI GIF] Round {rd+1} orientation_sweep...", end="", flush=True)
-        ox, oy, cw, ch, cpdx, cpdy = PostOptimizer._orientation_sweep(
-            ox, oy, cw, ch, cpdx, cpdy, mi_desc,
-            x_cands, y_cands, bw_j, bh_j,
+        # _phase_step_merged 同时返回平移后和 sweep 后的状态
+        tx, ty, nx, ny, nw, nh, npdx, npdy = PostOptimizer._phase_step_merged(
+            ox, oy, w, h, pdx, pdy,
+            mi_order, offsets_x, offsets_y, bw_j, bh_j,
             bench.nets_ptr, bench.pins_nodes,
             base_w, base_h, base_pdx, base_pdy)
 
-        cur_w, cur_h = np.array(cw), np.array(ch)
-        cur_x, cur_y = np.array(ox), np.array(oy)
-        changed = []
-        for i in range(len(mi_desc)):
-            idx = int(mi_desc[i])
-            if (abs(cur_w[idx] - prev_w[idx]) > 0.1 or
-                abs(cur_h[idx] - prev_h[idx]) > 0.1 or
-                abs(cur_x[idx] - prev_x[idx]) > 0.1 or
-                abs(cur_y[idx] - prev_y[idx]) > 0.1):
-                changed.append(idx)
+        tx_np, ty_np = np.array(tx), np.array(ty)
+        shift_dx = float(np.max(np.abs(tx_np[np.asarray(mi_order)] - prev_x[np.asarray(mi_order)])))
+        shift_dy = float(np.max(np.abs(ty_np[np.asarray(mi_order)] - prev_y[np.asarray(mi_order)])))
+        hpwl_after_shift = compute_hpwl(tx, ty, w, h, pdx, pdy)
+        print(f"  [SA GIF] phase {phase+1}/{num_phases} (step={cur_step:.0f}) "
+              f"shift=({shift_dx:.0f},{shift_dy:.0f}) "
+              f"HPWL_after_shift={hpwl_after_shift:.0f} "
+              f"({time.time()-t0:.1f}s)", flush=True)
 
-        hpwl_sweep = compute_hpwl()
-        print(f" {len(changed)} changed, HPWL={hpwl_sweep:.0f} ({time.time()-t0:.1f}s)", flush=True)
-        if changed:
-            hl_set = set(changed)
-            names = ', '.join(bench.names[i] if i < len(bench.names) else f'M{i}'
-                              for i in changed[:5])
-            suffix = f' +{len(changed)-5}' if len(changed) > 5 else ''
+        if shift_dx + shift_dy > 0.1:
             frames.append(snap(
-                f'Round {rd+1} Sweep  {names}{suffix}  HPWL={hpwl_sweep:.0f}',
-                hl=hl_set))
+                f'Phase {phase+1}/{num_phases}  Step={cur_step:.0f}  '
+                f'Global Shift (Δx={shift_dx:.0f}, Δy={shift_dy:.0f})  '
+                f'HPWL={hpwl_after_shift:.0f}',
+                tx, ty, w, h, pdx, pdy,
+                hl=set(int(i) for i in np.asarray(mi_order))))
 
-        print(f"  [ORI GIF] Round {rd+1} full_annealing...", end="", flush=True)
-        ox, oy = PostOptimizer._full_annealing(
-            ox, oy, cw, ch, optimizer.movable_indices, bw_j, bh_j,
-            bench.nets_ptr, bench.pins_nodes, cpdx, cpdy,
-            jnp.int32(annealing_phases), initial_step, jnp.float32(1),
-            base_ox, base_oy)
+        # sweep 后
+        hpwl_after_sweep = compute_hpwl(nx, ny, nw, nh, npdx, npdy)
+        cur_x, cur_y = np.array(nx), np.array(ny)
+        cur_w, cur_h = np.array(nw), np.array(nh)
+        moved = []
+        for i in range(len(mi_order)):
+            idx = int(mi_order[i])
+            pos_diff = abs(cur_x[idx] - tx_np[idx]) + abs(cur_y[idx] - ty_np[idx])
+            geom_diff = abs(cur_w[idx] - prev_w[idx]) + abs(cur_h[idx] - prev_h[idx])
+            if pos_diff > 0.1 or geom_diff > 0.1:
+                moved.append((idx, pos_diff + geom_diff, tx_np[idx], ty_np[idx]))
 
-        hpwl_after = compute_hpwl()
-        print(f" HPWL: {hpwl_before:.0f}->{hpwl_after:.0f} ({time.time()-t0:.1f}s)", flush=True)
-        frames.append(snap(
-            f'Round {rd+1} Refine  HPWL: {hpwl_before:.0f} \u2192 {hpwl_after:.0f}'))
+        print(f"           sweep: {len(moved)} changed, "
+              f"HPWL={hpwl_after_sweep:.0f}", flush=True)
 
-        if hpwl_after >= hpwl_before:
-            print(f"  [ORI GIF] 收敛, 停止", flush=True)
-            break
+        if moved:
+            moved.sort(key=lambda x: -x[1])
+            hl_set = {m[0] for m in moved}
+            ghost_top = [(m[0], m[2], m[3]) for m in moved[:8]]
+            frames.append(snap(
+                f'Phase {phase+1}/{num_phases}  Step={cur_step:.0f}  '
+                f'Orient+Move Sweep ({len(moved)} changed)  '
+                f'HPWL={hpwl_after_sweep:.0f}',
+                nx, ny, nw, nh, npdx, npdy,
+                hl=hl_set, ghost_list=ghost_top))
 
-    print(f"  [ORI GIF] 保存GIF ({len(frames)} frames)...", flush=True)
-    final = snap(f'Final  HPWL={compute_hpwl():.0f}')
+        ox, oy, w, h, pdx, pdy = nx, ny, nw, nh, npdx, npdy
+
+    final_hpwl = compute_hpwl(ox, oy, w, h, pdx, pdy)
+    frames.append(snap(f'Final  HPWL={final_hpwl:.0f}', ox, oy, w, h, pdx, pdy))
     for _ in range(4):
-        frames.append(final.copy())
+        frames.append(frames[-1].copy())
+
+    print(f"  [SA GIF] 保存GIF ({len(frames)} frames)...", flush=True)
     _save_gif(frames, output_path, fps)
-    print(f"  [ORI GIF] 完成 ({time.time()-t0:.1f}s)", flush=True)
+    print(f"  [SA GIF] 完成, Final HPWL={final_hpwl:.0f} ({time.time()-t0:.1f}s)", flush=True)

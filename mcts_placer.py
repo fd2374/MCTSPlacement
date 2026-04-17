@@ -6,11 +6,10 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import mctx
-from typing import Callable, Tuple
+from typing import Callable
 
 from placement_state import PlacementState, StateManager
 from placement_solver import PlacementSolver
-from sequence_pair import SequencePairSolver
 
 
 class MCTSPlacer:
@@ -50,14 +49,7 @@ class MCTSPlacer:
         valid_mask = self.state_manager.get_valid_actions(state, self.num_movable)
         logits = jnp.where(valid_mask, 0.0, -1e9)
         return logits
-    
-    
-    def _compute_final_positions(self, state: PlacementState) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """计算最终位置"""
-        return self.placement_solver.compute_final_positions(
-            state.s1, state.s2, state.orientations
-        )
-    
+
     def _single_rollout(self, state: PlacementState, rng_key) -> jnp.ndarray:
         """单次 rollout 到终态并返回奖励"""
         def cond(a):
@@ -74,11 +66,17 @@ class MCTSPlacer:
         leaf, key = jax.lax.while_loop(cond, step, (state, rng_key))
         return self.compute_reward(leaf)
 
-    def rollout(self, state: PlacementState, rng_key, n_rollouts: int = 8) -> jnp.ndarray:
-        """K 次并行 rollout 取均值，vmap 在 GPU 上几乎零额外开销"""
+    def rollout(self, state: PlacementState, rng_key, n_rollouts: int = 256) -> jnp.ndarray:
+        """K 次并行 rollout 取最大值（= 最低 HPWL）。
+
+        这里目标是 max-over-samples（找到最好的布局），而非估计随机策略下的期望
+        回报，因此使用 max 聚合：每个节点的 value 表示"该子树已观测到的最佳可达
+        reward"。n_rollouts 越大，这个上界估计越紧，对 Sequential Halving 和
+        PUCT 选择都更有利。
+        """
         keys = jax.random.split(rng_key, n_rollouts)
         values = jax.vmap(lambda k: self._single_rollout(state, k))(keys)
-        return jnp.mean(values)
+        return jnp.max(values)
     
     def compute_reward(self, state: PlacementState) -> jnp.ndarray:
         """计算奖励（仅在终端状态）"""

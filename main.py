@@ -11,7 +11,7 @@ import mctx
 import functools
 
 from data_loader import BookshelfLoader
-from placement_state import StateManager, PlacementState
+from placement_state import PlacementState, StateManager
 from mcts_placer import MCTSPlacer
 from visualizer import PlacementVisualizer
 from config import PlacementConfig
@@ -89,67 +89,94 @@ class PlacementRunner:
             qtransform=functools.partial(mctx.qtransform_completed_by_mix_value)
         )
         
-        # 提取最佳终端状态
-        best_state, best_reward = self._extract_best_terminal_state(policy_output.search_tree)
-        
-        print(f"  最佳奖励: {float(best_reward):.2f}")
-        print(f"  s1={best_state.s1}, s2={best_state.s2}")
-        print(f"  orientations={best_state.orientations}")
-        
         return policy_output
-    
-    def _extract_best_terminal_state(self, tree):
-        """从搜索树中提取最佳终端状态"""
+
+    def _extract_per_batch_best(self, tree, chunk_size=1024):
+        """对每个 batch 取其"最优合法终端节点"（HPWL 最低且不越界）。
+
+        做法：对全部 (B, N) 节点分块跑 compute_final_positions，对每个节点
+        检查是否所有 movable 都在 interposer 边界内，越界的 value 置 -inf 后
+        再 argmax。这样能捡回那些"全局最低但越界"导致的漏解问题。
+
+        分块是为了避免 B*N 全量一次性 vmap 时把 pins_dx/pdy 等中间数组全部
+        常驻显存（apte/xerox 规模 ~2.6GB，会 OOM）。
+
+        返回：
+          states: PlacementState，shape (B,)
+          hpwls:  (B,) 每个 batch 的最优合法 HPWL（+inf 表示该 batch 无合法终端）
+          node_indices: (B,) 每个 batch 最优合法终端节点在 tree 中的 node 下标
+        """
         target_step = 3 * self.num_movable
-        terminal_mask = tree.embeddings.step == target_step
-        masked_values = jnp.where(terminal_mask, tree.node_values, -jnp.inf)
-        
-        flat_values = masked_values.reshape(-1)
-        best_idx = int(jnp.argmax(flat_values))
-        best_value = float(flat_values[best_idx])
-        
-        if best_value == float('-inf'):
-            print("警告: 未找到终端状态，建议增加 --sims")
-            return StateManager.create_initial_state(self.num_movable), 0.0
-        
-        num_nodes = tree.node_values.shape[1]
-        batch_idx, node_idx = best_idx // num_nodes, best_idx % num_nodes
-        
-        best_state = PlacementState(
-            s1=tree.embeddings.s1[batch_idx, node_idx],
-            s2=tree.embeddings.s2[batch_idx, node_idx],
-            orientations=tree.embeddings.orientations[batch_idx, node_idx],
-            step=tree.embeddings.step[batch_idx, node_idx]
-        )
-        return best_state, -best_value
-    
-    def _extract_top_k_states(self, tree, k):
-        """从搜索树中提取每个 batch 的最佳终端状态，返回 top-K 个（向量化，O(1) 同步）"""
-        target_step = 3 * self.num_movable
-        terminal_mask = tree.embeddings.step == target_step
-        masked_values = jnp.where(terminal_mask, tree.node_values, -jnp.inf)
-        
+        terminal_mask = tree.embeddings.step == target_step  # (B, N)
+        B, N = terminal_mask.shape
+
+        s1 = tree.embeddings.s1  # (B, N, M)
+        s2 = tree.embeddings.s2
+        ori = tree.embeddings.orientations
+        M = s1.shape[-1]
+        total = B * N
+
+        flat_s1 = s1.reshape(total, M)
+        flat_s2 = s2.reshape(total, M)
+        flat_ori = ori.reshape(total, M)
+
+        mi = jnp.array(self.movable_indices)
+        bw = jnp.float32(self.boundary_width)
+        bh = jnp.float32(self.boundary_height)
+
+        compute_final = self.placer.placement_solver.compute_final_positions
+
+        @jax.jit
+        def check_chunk(s1c, s2c, oric):
+            # 只保留 x/y/w/h 用于 bounds 检查，pins_dx/pdy 立即丢弃避免留住显存
+            x, y, w, h, _, _ = jax.vmap(compute_final)(s1c, s2c, oric)
+            return (
+                jnp.all(x[:, mi] >= 0, axis=1) &
+                jnp.all(y[:, mi] >= 0, axis=1) &
+                jnp.all(x[:, mi] + w[:, mi] <= bw, axis=1) &
+                jnp.all(y[:, mi] + h[:, mi] <= bh, axis=1)
+            )
+
+        # Padding 到 chunk_size 整数倍，保证每块 shape 固定不触发重编译
+        pad = (-total) % chunk_size
+        if pad > 0:
+            flat_s1 = jnp.concatenate([flat_s1, jnp.zeros((pad, M), dtype=flat_s1.dtype)])
+            flat_s2 = jnp.concatenate([flat_s2, jnp.zeros((pad, M), dtype=flat_s2.dtype)])
+            flat_ori = jnp.concatenate([flat_ori, jnp.zeros((pad, M), dtype=flat_ori.dtype)])
+
+        padded_total = total + pad
+        parts = []
+        for start in range(0, padded_total, chunk_size):
+            end = start + chunk_size
+            parts.append(check_chunk(
+                flat_s1[start:end], flat_s2[start:end], flat_ori[start:end]))
+        in_bounds_flat = jnp.concatenate(parts)[:total]
+        in_bounds = in_bounds_flat.reshape(B, N)
+
+        valid_mask = terminal_mask & in_bounds
+        masked_values = jnp.where(valid_mask, tree.node_values, -jnp.inf)
+
         best_node_per_batch = jnp.argmax(masked_values, axis=1)
         best_value_per_batch = jnp.max(masked_values, axis=1)
-        
-        batch_indices = jnp.arange(masked_values.shape[0])
-        all_states = PlacementState(
-            s1=tree.embeddings.s1[batch_indices, best_node_per_batch],
-            s2=tree.embeddings.s2[batch_indices, best_node_per_batch],
-            orientations=tree.embeddings.orientations[batch_indices, best_node_per_batch],
+
+        batch_indices = jnp.arange(B)
+        states = PlacementState(
+            s1=s1[batch_indices, best_node_per_batch],
+            s2=s2[batch_indices, best_node_per_batch],
+            orientations=ori[batch_indices, best_node_per_batch],
             step=tree.embeddings.step[batch_indices, best_node_per_batch],
         )
-        all_hpwls = -best_value_per_batch
-        
-        top_k_indices = jnp.argsort(all_hpwls)[:k]
-        top_states = PlacementState(
-            s1=all_states.s1[top_k_indices],
-            s2=all_states.s2[top_k_indices],
-            orientations=all_states.orientations[top_k_indices],
-            step=all_states.step[top_k_indices],
-        )
-        top_hpwls = all_hpwls[top_k_indices]
-        return top_states, top_hpwls, int(k)
+        hpwls = jnp.where(best_value_per_batch > -jnp.inf,
+                          -best_value_per_batch, jnp.inf)
+
+        num_no_valid = int(jnp.sum(best_value_per_batch == -jnp.inf))
+        num_terminals = int(jnp.sum(terminal_mask))
+        num_valid_terminals = int(jnp.sum(valid_mask))
+        best_hpwl = float(jnp.min(hpwls))
+        print(f"  终端节点: {num_valid_terminals}/{num_terminals} 合法 "
+              f"（{B - num_no_valid}/{B} 个 batch 找到合法解）")
+        print(f"  最低合法 HPWL: {best_hpwl:.2f}")
+        return states, hpwls, best_node_per_batch
     
     def _calc_boundary_from_terminals(self):
         """从terminal节点计算interposer边界"""
@@ -246,35 +273,29 @@ def main():
     
     runner.save_tree(policy_output)
     
-    # 提取所有 batch 的最佳终端状态，计算坐标，过滤超出边界的解
-    all_states, all_mcts_hpwls, total = runner._extract_top_k_states(
-        policy_output.search_tree, config.batch_size
-    )
+    # 提取每个 batch 的最优合法终端状态（越界的自动跳过）+ 其所在 node index
+    per_batch_states, per_batch_hpwls, per_batch_node = runner._extract_per_batch_best(
+        policy_output.search_tree)
+    B = int(per_batch_hpwls.shape[0])
 
     all_x, all_y, all_w, all_h, all_pdx, all_pdy = jax.vmap(
         lambda s1, s2, ori: runner.placer.placement_solver.compute_final_positions(s1, s2, ori)
-    )(all_states.s1, all_states.s2, all_states.orientations)
+    )(per_batch_states.s1, per_batch_states.s2, per_batch_states.orientations)
 
-    mi = jnp.array(runner.movable_indices)
-    in_bounds = (
-        jnp.all(all_x[:, mi] >= 0, axis=1) &
-        jnp.all(all_y[:, mi] >= 0, axis=1) &
-        jnp.all(all_x[:, mi] + all_w[:, mi] <= runner.boundary_width, axis=1) &
-        jnp.all(all_y[:, mi] + all_h[:, mi] <= runner.boundary_height, axis=1)
-    )
-    valid_mask = in_bounds & (all_mcts_hpwls > 0) & (all_mcts_hpwls < jnp.inf)
-    num_valid = int(jnp.sum(valid_mask))
-    num_oob = total - num_valid
-    print(f"  有效解: {num_valid}/{total}（删除 {num_oob} 个超出边界/无效解）")
+    # _extract_per_batch_best 已经过滤过越界解，这里只需按 HPWL 升序取 top-K
+    num_valid = int(jnp.sum(per_batch_hpwls < jnp.inf))
+    top_k = min(config.batch_size // 5 + 1, max(num_valid, 1))
+    # batch_of_cand[i] = 候选 i 来自哪个 batch（全局 batch index），
+    # 配合 per_batch_node 可直接定位到 tree 中对应终端节点
+    batch_of_cand = jnp.argsort(per_batch_hpwls)[:top_k]
 
-    sorted_hpwls = jnp.where(valid_mask, all_mcts_hpwls, jnp.inf)
-    top_k = min(config.batch_size // 5 + 1, num_valid)
-    top_indices = jnp.argsort(sorted_hpwls)[:top_k]
-
-    all_x, all_y = all_x[top_indices], all_y[top_indices]
-    all_w, all_h = all_w[top_indices], all_h[top_indices]
-    all_pdx, all_pdy = all_pdx[top_indices], all_pdy[top_indices]
-    top_mcts_hpwls = all_mcts_hpwls[top_indices]
+    all_x = all_x[batch_of_cand]
+    all_y = all_y[batch_of_cand]
+    all_w = all_w[batch_of_cand]
+    all_h = all_h[batch_of_cand]
+    all_pdx = all_pdx[batch_of_cand]
+    all_pdy = all_pdy[batch_of_cand]
+    top_mcts_hpwls = per_batch_hpwls[batch_of_cand]
     k = top_k
 
     # 保留 MCTS 原始坐标用于最终对比可视化
@@ -282,12 +303,15 @@ def main():
     mcts_raw_w, mcts_raw_h = all_w.copy(), all_h.copy()
     mcts_raw_pdx, mcts_raw_pdy = all_pdx.copy(), all_pdy.copy()
 
-    # Phase 1: 批量后处理位置优化
-    print(f"\n开始后处理优化（{k} 个候选方案，GPU 并行）...")
+    # Phase 1: 批量后处理（合并版：整体平移 + 位置退火 + 方向翻转）
+    print(f"\n开始后处理优化（{k} 个候选方案，合并 位置+方向，GPU 并行）...")
     start = time.time()
 
     optimizer = PostOptimizer(runner.bench, runner.movable_indices)
-    all_opt_x, all_opt_y, all_hpwls = optimizer.optimize_batch(
+    (all_opt_x, all_opt_y,
+     all_opt_w, all_opt_h,
+     all_opt_pdx, all_opt_pdy,
+     all_hpwls, all_best_ord, orderings) = optimizer.optimize_batch(
         all_x, all_y, all_w, all_h, all_pdx, all_pdy,
         boundary_width=runner.boundary_width,
         boundary_height=runner.boundary_height,
@@ -309,117 +333,48 @@ def main():
         else:
             print(f"  候选 {i+1}/{k}: MCTS={mcts_h:.0f} → PostOpt={opt_h:.0f}")
 
-    best_idx = running_best_idx
-
-    # Phase 2: 方向优化（对 top-10 方案贪心翻转每个模块方向 + 重新退火）
-    top10_count = min(10, k)
-    top10_indices = jnp.argsort(all_hpwls)[:top10_count]
-
-    print(f"\n开始方向优化（top {top10_count} 候选）...")
-    start = time.time()
-
-    ori_x, ori_y, ori_w, ori_h, ori_pdx, ori_pdy, ori_hpwls = optimizer.optimize_orientations(
-        all_opt_x[top10_indices], all_opt_y[top10_indices],
-        all_w[top10_indices], all_h[top10_indices],
-        all_pdx[top10_indices], all_pdy[top10_indices],
-        boundary_width=runner.boundary_width,
-        boundary_height=runner.boundary_height,
-        search_points=config.search_points,
-        annealing_phases=config.annealing_phases)
-
-    print(f"方向优化时间: {time.time() - start:.2f}秒")
-
-    print(f"\n方向优化结果:")
-    ori_best_idx = -1
-    ori_best_hpwl = float('inf')
-    for i in range(top10_count):
-        before_h = float(all_hpwls[int(top10_indices[i])])
-        after_h = float(ori_hpwls[i])
-        if after_h < ori_best_hpwl:
-            ori_best_hpwl = after_h
-            ori_best_idx = i
-            print(f"  方向优化 {i+1}/{top10_count}: PostOpt={before_h:.0f} → OriOpt={after_h:.0f} ← 最优")
-        else:
-            print(f"  方向优化 {i+1}/{top10_count}: PostOpt={before_h:.0f} → OriOpt={after_h:.0f}")
-
-    # 选全局最优 & 画出各阶段的图
-    use_ori = ori_best_hpwl < running_best_hpwl
-    trace_idx = int(top10_indices[ori_best_idx]) if use_ori else best_idx
-    if use_ori:
-        print(f"\n方向优化改善: {running_best_hpwl:.0f} → {ori_best_hpwl:.0f}")
+    trace_idx = running_best_idx
 
     runner.plot(mcts_raw_x[trace_idx], mcts_raw_y[trace_idx],
                 mcts_raw_w[trace_idx], mcts_raw_h[trace_idx],
                 mcts_raw_pdx[trace_idx], mcts_raw_pdy[trace_idx],
                 "stage1_mcts.png", "Stage 1: MCTS")
     runner.plot(all_opt_x[trace_idx], all_opt_y[trace_idx],
-                all_w[trace_idx], all_h[trace_idx],
-                all_pdx[trace_idx], all_pdy[trace_idx],
-                "stage2_postopt.png",
-                "Stage 2: PostOpt" + ("" if use_ori else " (Final)"))
-    if use_ori:
-        runner.plot(ori_x[ori_best_idx], ori_y[ori_best_idx],
-                    ori_w[ori_best_idx], ori_h[ori_best_idx],
-                    ori_pdx[ori_best_idx], ori_pdy[ori_best_idx],
-                    "stage3_oriopt.png", "Stage 3: OriOpt (Final)")
+                all_opt_w[trace_idx], all_opt_h[trace_idx],
+                all_opt_pdx[trace_idx], all_opt_pdy[trace_idx],
+                "stage2_postopt.png", "Stage 2: PostOpt (Final)")
 
-    # GIF generation
     if config.save_gif:
-        from animation import create_mcts_gif, create_sa_gif, create_orientation_gif
+        from animation import create_mcts_gif, create_sa_gif
         gif_t0 = time.time()
         print("\n生成动画GIF...")
 
         gif_bw, gif_bh = float(runner.boundary_width), float(runner.boundary_height)
 
-        gif_mcts_x = mcts_raw_x[trace_idx]
-        gif_mcts_y = mcts_raw_y[trace_idx]
-        gif_mcts_w = mcts_raw_w[trace_idx]
-        gif_mcts_h = mcts_raw_h[trace_idx]
-        gif_mcts_pdx = mcts_raw_pdx[trace_idx]
-        gif_mcts_pdy = mcts_raw_pdy[trace_idx]
-
-        gif_sa_x = all_opt_x[trace_idx]
-        gif_sa_y = all_opt_y[trace_idx]
-        gif_sa_w = all_w[trace_idx]
-        gif_sa_h = all_h[trace_idx]
-        gif_sa_pdx = all_pdx[trace_idx]
-        gif_sa_pdy = all_pdy[trace_idx]
-
-        hpwl_fn = PostOptimizer._compute_hpwl_direct
-        h_mcts = float(hpwl_fn(gif_mcts_x, gif_mcts_y, gif_mcts_w, gif_mcts_h,
-                                runner.bench.nets_ptr, runner.bench.pins_nodes,
-                                gif_mcts_pdx, gif_mcts_pdy))
-        h_sa = float(hpwl_fn(gif_sa_x, gif_sa_y, gif_sa_w, gif_sa_h,
-                              runner.bench.nets_ptr, runner.bench.pins_nodes,
-                              gif_sa_pdx, gif_sa_pdy))
-        print(f"  GIF数据验证: MCTS->SA起点 HPWL={h_mcts:.0f}, SA终点=ORI起点 HPWL={h_sa:.0f}")
+        # 最优解对应的 MCTS 源 (batch 索引 + 树内 node 索引)
+        origin_batch = int(batch_of_cand[trace_idx])
+        origin_node = int(per_batch_node[origin_batch])
+        winning_ord = int(all_best_ord[trace_idx])
+        labels = optimizer.ordering_labels(len(orderings))
+        print(f"  最优解来自 batch {origin_batch} 的 node {origin_node}，"
+              f"使用 ordering {winning_ord} [{labels[winning_ord]}]")
 
         create_mcts_gif(
             policy_output.search_tree, runner.placer,
-            runner.num_movable, 0,
+            runner.num_movable, origin_batch, origin_node,
             f'{config.output_dir}/stage1_mcts.gif',
-            final_placement=(gif_mcts_x, gif_mcts_y, gif_mcts_w, gif_mcts_h,
-                             gif_mcts_pdx, gif_mcts_pdy),
             boundary_wh=(gif_bw, gif_bh))
 
         create_sa_gif(
-            optimizer,
-            gif_mcts_x, gif_mcts_y, gif_mcts_w, gif_mcts_h,
-            gif_mcts_pdx, gif_mcts_pdy,
-            runner.bench, gif_bw, gif_bh,
+            optimizer, runner.bench,
+            mcts_raw_x[trace_idx], mcts_raw_y[trace_idx],
+            mcts_raw_w[trace_idx], mcts_raw_h[trace_idx],
+            mcts_raw_pdx[trace_idx], mcts_raw_pdy[trace_idx],
+            orderings[winning_ord], labels[winning_ord],
+            gif_bw, gif_bh,
             config.search_points, config.annealing_phases,
-            f'{config.output_dir}/stage2_sa.gif',
-            target_x=gif_sa_x, target_y=gif_sa_y,
-            target_w=gif_sa_w, target_h=gif_sa_h,
-            target_pdx=gif_sa_pdx, target_pdy=gif_sa_pdy)
+            f'{config.output_dir}/stage2_sa.gif')
 
-        create_orientation_gif(
-            optimizer,
-            gif_sa_x, gif_sa_y, gif_sa_w, gif_sa_h,
-            gif_sa_pdx, gif_sa_pdy,
-            runner.bench, gif_bw, gif_bh,
-            config.search_points, config.annealing_phases,
-            f'{config.output_dir}/stage3_orientation.gif')
         print(f"GIF生成总耗时: {time.time()-gif_t0:.1f}s")
 
     print("\n" + "="*60)
