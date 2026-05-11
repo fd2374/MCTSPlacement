@@ -22,24 +22,34 @@ class PlacementConfig:
     seed: int = 0
     batch_size: int = 1
     gumbel_scale: float = 0.1
-    # OOB 软惩罚系数：reward = -HPWL * (1 + alpha * oob_ratio)
-    # oob_ratio = bbox 越界比率（归一化到 interposer 尺寸），clip 到 10
-    # 0 = 不惩罚（等同原逻辑）；1~3 对紧约束场景有效
-    oob_penalty_alpha: float = 1.0
-    
+
     # Interposer边界（None = 从terminal自动计算）
     boundary_width: Optional[float] = None
     boundary_height: Optional[float] = None
     
+    # MCTS rollout leaf 并行数（每个 MCTS 节点 expansion 时 vmap rollout 的 leaves 数）
+    rollout_leaves: int = 128
+
     # 后处理优化参数
     search_points: int = 20
+    # annealing_phases: 退火总 phase 数（注意：新语义是“总数”，会按 n_runs 向下取整拆分）
+    #   旧语义：annealing_phases 是每个 reheat 段的 phase 数，总 = annealing_phases × n_runs
+    #   新语义：annealing_phases 是所有 reheat 段加起来的总 phase 数，per_run = annealing_phases // n_runs (floor)
     annealing_phases: int = 5
-    
+    # 退火 reheat 次数：n_runs=1 = 无 reheat，纯 baseline 单段；n_runs>=2 = 完整跑 N 段
+    n_runs: int = 1
+    # reheat 段起始温度系数：第 2 段及以后的 cur_hot = reheat_factor * initial_step
+    #   1.0 = 完整 reheat；< 1.0 = 跳过 best 处的大步长，直接进中温
+    reheat_factor: float = 0.9
+
     # 输出配置
     output_dir: str = "."
     save_visualization: bool = True
     save_tree: bool = True
     save_gif: bool = False
+
+    # MCTS top-k 候选缓存路径（存在则 load 跳过 MCTS, 否则 dump 后跑 MCTS）
+    mcts_cache_path: Optional[str] = None
     
     # YAML键名 -> dataclass字段名 映射
     _KEY_MAP = {

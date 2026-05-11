@@ -9,9 +9,27 @@
 """
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P, AxisType
 from typing import Tuple
+
+# 与 main.py 保持一致的 device mesh：把候选维度沿 'B' 轴 sharding 到所有可见 GPU。
+# Auto axis type + 不 set_mesh，外部数组都按 replicated 处理；shard_map 调用时
+# 显式传 mesh=_MESH。
+_N_DEV = jax.local_device_count()
+_MESH = jax.make_mesh((_N_DEV,), ('B',), axis_types=(AxisType.Auto,))
+
+# ===== 退火 reheat 配置：现在通过 optimize_batch 的 n_runs / reheat_factor 参数传入 =====
+# 语义：annealing_phases (total) 被均匀拆成 n_runs 段，每段 floor(total / n_runs) phase。
+#   - n_runs=1: 纯 baseline 单段，无 reheat（initial_step → final_step 几何衰减一次）
+#   - n_runs>=2: 跑 N 段。第 1 段从 initial_step 出发；后续段从 best snapshot 重启，
+#     起始温度 cur_hot = reheat_factor × initial_step。每段都走相同的几何衰减到 final_step。
+#     best snapshot 只在改善时前进，保证严格 ≥ baseline。
+# improve_eps 仍硬编码：判断"新解严格好于 best"的容差（1.0 = HPWL 单位）。
+_ANNEAL_IMPROVE_EPS = 1.0
 
 
 class PostOptimizer:
@@ -22,14 +40,9 @@ class PostOptimizer:
         self.movable_indices = jnp.array(movable_indices)
         self.num_movable = len(movable_indices)
 
+        # 缓存只在 shard_map closure 用到的 jit 输入引用
         self.nets_ptr = bench.nets_ptr
         self.pins_nodes = bench.pins_nodes
-        self.pins_dx = bench.pins_dx
-        self.pins_dy = bench.pins_dy
-
-        self.fixed_x = jnp.array(bench.x_fixed)
-        self.fixed_y = jnp.array(bench.y_fixed)
-        self.is_terminal = jnp.array(bench.is_terminal)
 
     # ======================== 静态JIT核心计算 ========================
 
@@ -311,68 +324,99 @@ class PostOptimizer:
     def _full_annealing_merged(opt_x, opt_y, widths, heights, pins_dx, pins_dy,
                                 movable_indices, bw, bh,
                                 nets_ptr, pins_nodes,
-                                num_phases, initial_step, final_step,
+                                total_phases, initial_step, final_step,
                                 base_offsets_x, base_offsets_y,
                                 base_widths, base_heights,
-                                base_pins_dx, base_pins_dy):
-        """整轮合并退火：每个 phase 执行 [整体平移 + 方向·位置联合 sweep]。
+                                base_pins_dx, base_pins_dy,
+                                n_runs, reheat_factor):
+        """多段 reheat 退火（总 phase 数固定）。
 
-        - 第 1 个 phase 的 offset 网格几乎覆盖整张 interposer，起到全图搜索作用；
-        - 后续 phase 随 cur_step 指数收缩，自动过渡到精细调整；
-        - ori=当前方向 的分支等价于纯位置 sweep，所以无需再单独 sweep。
+        语义：
+          - total_phases 是所有 reheat 段加起来的总 phase 数
+          - 拆分为 n_runs 段，每段 per_run = total_phases // n_runs（floor）
+          - 每段从 best snapshot 出发，跑 per_run 个 phase 的 hot→cold 几何衰减：
+              第 1 段起始温度 = initial_step
+              后续段起始温度 = reheat_factor × initial_step
+              终止温度 = final_step
+          - best snapshot 只在 HPWL 改善时前进，保证严格 ≥ baseline 单段
+          - n_runs=1 时退化为单段 baseline，等价旧 ANNEAL_DISABLE_REHEAT=1 行为
+          - 总 GPU 算力代价 ≈ baseline × 1 倍（per_run 总和等于 total_phases）
         """
-        def phase_body(phase, carry):
-            ox, oy, w, h, pdx, pdy = carry
-            t = phase / jnp.maximum(1, num_phases - 1)
-            ratio = final_step / jnp.maximum(initial_step, final_step)
-            cur_step = initial_step * ratio ** t
+        per_run = jnp.maximum(jnp.int32(1), total_phases // jnp.int32(n_runs))
+
+        # baseline 节奏：cur_step 从 cur_init 衰减到 final_step，分 per_run 步
+        def baseline_body(phase, carry):
+            ox, oy, w, h, pdx, pdy, cur_init = carry
+            t = phase.astype(jnp.float32) / jnp.maximum(
+                jnp.float32(1.0), (per_run - 1).astype(jnp.float32))
+            ratio = final_step / jnp.maximum(cur_init, final_step)
+            cur_step = cur_init * ratio ** t
             offsets_x = base_offsets_x * cur_step
             offsets_y = base_offsets_y * cur_step
-
             _, _, ox, oy, w, h, pdx, pdy = PostOptimizer._phase_step_merged(
                 ox, oy, w, h, pdx, pdy,
                 movable_indices, offsets_x, offsets_y, bw, bh,
                 nets_ptr, pins_nodes,
                 base_widths, base_heights, base_pins_dx, base_pins_dy)
-            return ox, oy, w, h, pdx, pdy
+            return ox, oy, w, h, pdx, pdy, cur_init
 
-        return jax.lax.fori_loop(
-            0, num_phases, phase_body,
-            (opt_x, opt_y, widths, heights, pins_dx, pins_dy))
+        # 初始 best = 输入态
+        init_hpwl = PostOptimizer._compute_hpwl_direct(
+            opt_x, opt_y, widths, heights,
+            nets_ptr, pins_nodes, pins_dx, pins_dy)
+        reheat_init = jnp.float32(reheat_factor) * initial_step
+        improve_eps = jnp.float32(_ANNEAL_IMPROVE_EPS)
+
+        def run_body(run_idx, run_carry):
+            (bx, by, bwg, bhg, bpdx, bpdy, best_h) = run_carry
+            # 第 1 段用完整 initial_step，后续段用 reheat_factor × initial_step
+            cur_init = jnp.where(run_idx == 0, initial_step, reheat_init)
+            ex, ey, ew, eh, epdx, epdy, _ = jax.lax.fori_loop(
+                0, per_run, baseline_body,
+                (bx, by, bwg, bhg, bpdx, bpdy, cur_init))
+            end_h = PostOptimizer._compute_hpwl_direct(
+                ex, ey, ew, eh, nets_ptr, pins_nodes, epdx, epdy)
+            improved = end_h < (best_h - improve_eps)
+            # best snapshot 只前进不后退
+            n_bx   = jnp.where(improved, ex,   bx)
+            n_by   = jnp.where(improved, ey,   by)
+            n_bw   = jnp.where(improved, ew,   bwg)
+            n_bh   = jnp.where(improved, eh,   bhg)
+            n_bpdx = jnp.where(improved, epdx, bpdx)
+            n_bpdy = jnp.where(improved, epdy, bpdy)
+            n_best_h = jnp.where(improved, end_h, best_h)
+            return (n_bx, n_by, n_bw, n_bh, n_bpdx, n_bpdy, n_best_h)
+
+        init_carry = (opt_x, opt_y, widths, heights, pins_dx, pins_dy,
+                      init_hpwl)
+        final_carry = jax.lax.fori_loop(
+            0, jnp.int32(n_runs), run_body, init_carry)
+        return final_carry[:6]
 
     @staticmethod
     @jax.jit
     def _vmap_annealing_merged(batch_x, batch_y, batch_w, batch_h, batch_pdx, batch_pdy,
                                 movable_indices, bw, bh, nets_ptr, pins_nodes,
-                                num_phases, initial_step, final_step,
+                                total_phases, initial_step, final_step,
                                 base_offsets_x, base_offsets_y,
                                 base_widths, base_heights,
-                                base_pins_dx, base_pins_dy):
+                                base_pins_dx, base_pins_dy,
+                                n_runs, reheat_factor):
         """vmap 并行合并版退火：一次 GPU 调用处理整个 chunk。"""
         def single(args):
             x, y, w, h, pdx, pdy = args
             ox, oy, nw, nh, npdx, npdy = PostOptimizer._full_annealing_merged(
                 x, y, w, h, pdx, pdy, movable_indices, bw, bh,
                 nets_ptr, pins_nodes,
-                num_phases, initial_step, final_step,
+                total_phases, initial_step, final_step,
                 base_offsets_x, base_offsets_y,
-                base_widths, base_heights, base_pins_dx, base_pins_dy)
+                base_widths, base_heights, base_pins_dx, base_pins_dy,
+                n_runs, reheat_factor)
             hpwl = PostOptimizer._compute_hpwl_direct(
                 ox, oy, nw, nh, nets_ptr, pins_nodes, npdx, npdy)
             return ox, oy, nw, nh, npdx, npdy, hpwl
         return jax.vmap(single)((batch_x, batch_y, batch_w, batch_h,
                                  batch_pdx, batch_pdy))
-
-    # ======================== 公开方法 ========================
-
-    def _get_boundary_from_terminals(self) -> Tuple[float, float]:
-        """从终端节点计算 interposer 边界。"""
-        terminal_mask = self.is_terminal == 1
-        terminal_x = jnp.where(terminal_mask, self.fixed_x, 0)
-        terminal_y = jnp.where(terminal_mask, self.fixed_y, 0)
-        terminal_w = jnp.where(terminal_mask, self.bench.widths, 0)
-        terminal_h = jnp.where(terminal_mask, self.bench.heights, 0)
-        return float(jnp.max(terminal_x + terminal_w)), float(jnp.max(terminal_y + terminal_h))
 
     def _make_offsets(self, search_points):
         sp = search_points
@@ -382,7 +426,9 @@ class PostOptimizer:
         nonzero = (gx != 0) | (gy != 0)
         return jnp.where(nonzero, gx, 0.0), jnp.where(nonzero, gy, 0.0)
 
-    def build_orderings(self, num_random_orderings: int = 4, seed: int = 0):
+    # ======================== 公开方法 ========================
+
+    def build_orderings(self, num_random_orderings: int, seed: int = 0):
         """构造用于 optimize_batch 的模块遍历顺序集合（全随机）。
 
         动画重放 Stage 2 时可以直接根据 ordering 索引复用同一份 ordering。
@@ -394,18 +440,24 @@ class PostOptimizer:
             orderings.append(jax.random.permutation(subkey, self.movable_indices))
         return orderings
 
-    def ordering_labels(self, num_random_orderings: int = 4):
+    def ordering_labels(self, num_random_orderings: int):
         return [f"随机{i+1}" for i in range(num_random_orderings)]
 
     def optimize_batch(self, all_x, all_y, all_w, all_h, all_pdx, all_pdy,
                        boundary_width=None, boundary_height=None,
                        max_iterations=5,
                        search_points=20, chunk_size=16,
-                       num_random_orderings=4, seed=0):
+                       num_random_orderings=4, seed=0,
+                       n_runs=1, reheat_factor=0.9):
         """批量后处理（合并版：整体平移 + 方向·位置联合 sweep）。
 
         K 个候选方案 × 多种 ordering，每个 phase 同时做整体平移、方向翻转和
         本地位置搜索，逐候选取最优。
+
+        Args:
+            max_iterations: 退火总 phase 数（拆为 n_runs 段，每段 floor(total/n_runs)）
+            n_runs: reheat 次数（1 = 单段 baseline，>=2 = N 段 reheat）
+            reheat_factor: 第 2 段及以后的起始温度系数（factor × initial_step）
 
         Returns:
           best_x/y/w/h/pdx/pdy: 最优几何
@@ -414,7 +466,7 @@ class PostOptimizer:
           orderings: 本次使用的 ordering 列表（顺序与 index 一致）
         """
         if boundary_width is None or boundary_height is None:
-            boundary_width, boundary_height = self._get_boundary_from_terminals()
+            boundary_width, boundary_height = self.bench.boundary_from_terminals()
 
         bw, bh = jnp.float32(boundary_width), jnp.float32(boundary_height)
         initial_step = jnp.float32(max(boundary_width, boundary_height) // search_points)
@@ -425,11 +477,20 @@ class PostOptimizer:
         base_pdx = jnp.array(self.bench.pins_dx)
         base_pdy = jnp.array(self.bench.pins_dy)
 
+        # 把 num_random_orderings 向上对齐到 n_dev 的整数倍：每卡承担 1 个 ordering，分 n_rounds 轮。
+        # 用户给 4 + 8 张卡，自动升到 8（多生成 4 个随机 ordering，多样性更高，不会变差）；
+        # n_dev=1 时此条件总成立，num_random_orderings 保持原值。
+        n_dev = _N_DEV
+        if num_random_orderings < n_dev:
+            num_random_orderings = n_dev
+        elif num_random_orderings % n_dev != 0:
+            num_random_orderings = ((num_random_orderings + n_dev - 1) // n_dev) * n_dev
+
         orderings = self.build_orderings(num_random_orderings, seed)
         labels = self.ordering_labels(num_random_orderings)
 
         K = all_x.shape[0]
-        pad = (-K) % chunk_size
+        pad = (-K) % chunk_size  # K 向上对齐到 chunk_size 的整数倍，避免单 vmap 一次性吞 K 个候选 OOM
         if pad > 0:
             def p(a):
                 return jnp.concatenate([a, jnp.zeros((pad,) + a.shape[1:], dtype=a.dtype)])
@@ -438,6 +499,7 @@ class PostOptimizer:
             all_pdx, all_pdy = p(all_pdx), p(all_pdy)
 
         total = all_x.shape[0]
+        n_chunks = total // chunk_size
         best_x = jnp.zeros_like(all_x)
         best_y = jnp.zeros_like(all_y)
         best_w = jnp.zeros_like(all_w)
@@ -447,48 +509,96 @@ class PostOptimizer:
         best_hpwl = jnp.full(total, jnp.inf)
         best_ord = jnp.full(total, -1, dtype=jnp.int32)
 
-        for oi, mi in enumerate(orderings):
+        # 在 ordering 维度上跨设备并行：每张卡承担 1 个 ordering 在全部 K 候选上的退火，
+        # 各卡间无通信。N_DEV=1 时退化为单卡顺序跑 num_random_orderings 轮，每轮 1 个 ordering，
+        # 行为和原版语义一致；多余的开销只是一次性的 jit 编译。
+        #
+        # 为避免 shard_map 内部 Python for 循环展开 ~K/chunk_size 个 chunk 导致编译图爆炸，
+        # 把候选维度 reshape 成 (n_chunks, chunk_size, ...) 后用 jax.lax.scan 滚动调用
+        # _vmap_annealing_merged。scan 体只 trace 一次，编译规模与原版 _vmap_annealing_merged 相当。
+        all_x_r = all_x.reshape(n_chunks, chunk_size, *all_x.shape[1:])
+        all_y_r = all_y.reshape(n_chunks, chunk_size, *all_y.shape[1:])
+        all_w_r = all_w.reshape(n_chunks, chunk_size, *all_w.shape[1:])
+        all_h_r = all_h.reshape(n_chunks, chunk_size, *all_h.shape[1:])
+        all_pdx_r = all_pdx.reshape(n_chunks, chunk_size, *all_pdx.shape[1:])
+        all_pdy_r = all_pdy.reshape(n_chunks, chunk_size, *all_pdy.shape[1:])
+
+        @functools.partial(jax.shard_map,
+                           mesh=_MESH,
+                           in_specs=(P('B', None),) + (P(),) * 6,
+                           out_specs=(P('B', None, None),) * 6 + (P('B', None),),
+                           check_vma=False)
+        def _shard_orderings(mi_b, lx_r, ly_r, lw_r, lh_r, lpdx_r, lpdy_r):
+            # mi_b: (1, num_movable) per device；lx_r 等：(n_chunks, chunk_size, ...) 复制到每卡
+            mi = mi_b[0]
             shared = (mi, bw, bh,
                       self.nets_ptr, self.pins_nodes,
                       jnp.int32(max_iterations),
                       initial_step, jnp.float32(1),
                       base_offsets_x, base_offsets_y,
-                      base_w, base_h, base_pdx, base_pdy)
+                      base_w, base_h, base_pdx, base_pdy,
+                      jnp.int32(n_runs), jnp.float32(reheat_factor))
 
-            res_x, res_y, res_w, res_h, res_pdx, res_pdy, res_hpwl = [], [], [], [], [], [], []
-            for start in range(0, total, chunk_size):
-                end = start + chunk_size
-                ox, oy, ow, oh, opdx, opdy, hpwl = self._vmap_annealing_merged(
-                    all_x[start:end], all_y[start:end],
-                    all_w[start:end], all_h[start:end],
-                    all_pdx[start:end], all_pdy[start:end], *shared)
-                res_x.append(ox)
-                res_y.append(oy)
-                res_w.append(ow)
-                res_h.append(oh)
-                res_pdx.append(opdx)
-                res_pdy.append(opdy)
-                res_hpwl.append(hpwl)
+            def scan_body(_, chunk_in):
+                cx, cy, cw, ch, cpdx, cpdy = chunk_in
+                return None, self._vmap_annealing_merged(
+                    cx, cy, cw, ch, cpdx, cpdy, *shared)
 
-            cur_x = jnp.concatenate(res_x)
-            cur_y = jnp.concatenate(res_y)
-            cur_w = jnp.concatenate(res_w)
-            cur_h = jnp.concatenate(res_h)
-            cur_pdx = jnp.concatenate(res_pdx)
-            cur_pdy = jnp.concatenate(res_pdy)
-            cur_hpwl = jnp.concatenate(res_hpwl)
+            _, results = jax.lax.scan(
+                scan_body, None,
+                (lx_r, ly_r, lw_r, lh_r, lpdx_r, lpdy_r))
+            # results 是 7 元组，前 6 项 (n_chunks, chunk_size, ...)，最后一项 (n_chunks, chunk_size)
+            cx = results[0].reshape(total, *lx_r.shape[2:])
+            cy = results[1].reshape(total, *ly_r.shape[2:])
+            cw = results[2].reshape(total, *lw_r.shape[2:])
+            ch = results[3].reshape(total, *lh_r.shape[2:])
+            cpdx = results[4].reshape(total, *lpdx_r.shape[2:])
+            cpdy = results[5].reshape(total, *lpdy_r.shape[2:])
+            chpwl = results[6].reshape(total)
+            # 加 leading 1 维 -> shard_map out_specs P('B', ...) 拼回 (n_dev, total, ...)
+            return (cx[None], cy[None], cw[None], ch[None],
+                    cpdx[None], cpdy[None], chpwl[None])
 
-            improved = cur_hpwl < best_hpwl
-            best_x = jnp.where(improved[:, None], cur_x, best_x)
-            best_y = jnp.where(improved[:, None], cur_y, best_y)
-            best_w = jnp.where(improved[:, None], cur_w, best_w)
-            best_h_geom = jnp.where(improved[:, None], cur_h, best_h_geom)
-            best_pdx = jnp.where(improved[:, None], cur_pdx, best_pdx)
-            best_pdy = jnp.where(improved[:, None], cur_pdy, best_pdy)
-            best_ord = jnp.where(improved, jnp.int32(oi), best_ord)
-            best_hpwl = jnp.minimum(best_hpwl, cur_hpwl)
+        n_rounds = num_random_orderings // n_dev
+        for r in range(n_rounds):
+            mi_round = jnp.stack(orderings[r * n_dev:(r + 1) * n_dev])  # (n_dev, num_movable)
+            cur_x_b, cur_y_b, cur_w_b, cur_h_b, cur_pdx_b, cur_pdy_b, cur_hpwl_b = \
+                _shard_orderings(mi_round, all_x_r, all_y_r, all_w_r, all_h_r, all_pdx_r, all_pdy_r)
+            # 各 cur_*_b shape: (n_dev, total, ...)；cur_hpwl_b: (n_dev, total)
+
+            # 从本轮 n_dev 个 ordering 里每个 candidate 选 HPWL 最低者，一次 vectorize
+            argmin_local = jnp.argmin(cur_hpwl_b, axis=0)            # (total,)
+            round_hpwl = jnp.take_along_axis(cur_hpwl_b, argmin_local[None], axis=0)[0]
+            round_ord = (r * n_dev + argmin_local).astype(jnp.int32)
+            def _gather(arr_b):  # (n_dev, total, M) -> (total, M)
+                return jnp.take_along_axis(
+                    arr_b, argmin_local[None, :, None], axis=0)[0]
+            round_x   = _gather(cur_x_b)
+            round_y   = _gather(cur_y_b)
+            round_w   = _gather(cur_w_b)
+            round_h   = _gather(cur_h_b)
+            round_pdx = _gather(cur_pdx_b)
+            round_pdy = _gather(cur_pdy_b)
+
+            # 跨 round 更新 best
+            improved = round_hpwl < best_hpwl
+            best_x = jnp.where(improved[:, None], round_x, best_x)
+            best_y = jnp.where(improved[:, None], round_y, best_y)
+            best_w = jnp.where(improved[:, None], round_w, best_w)
+            best_h_geom = jnp.where(improved[:, None], round_h, best_h_geom)
+            best_pdx = jnp.where(improved[:, None], round_pdx, best_pdx)
+            best_pdy = jnp.where(improved[:, None], round_pdy, best_pdy)
+            best_ord = jnp.where(improved, round_ord, best_ord)
+            best_hpwl = jnp.minimum(best_hpwl, round_hpwl)
+
             cur_best = float(jnp.min(best_hpwl[:K]))
-            print(f"    策略 {oi+1}/{len(orderings)} [{labels[oi]}] 完成, 当前全局最优={cur_best:.0f}")
+            if n_dev == 1:
+                # 单卡：每轮 = 1 个 ordering
+                print(f"    策略 {r+1}/{num_random_orderings} [{labels[r]}] 完成, "
+                      f"当前全局最优={cur_best:.0f}")
+            else:
+                print(f"    第 {r+1}/{n_rounds} 轮 (策略 {r*n_dev+1}~{(r+1)*n_dev}, "
+                      f"{n_dev} 路 ordering 并行) 完成, 当前全局最优={cur_best:.0f}")
 
         return (best_x[:K], best_y[:K],
                 best_w[:K], best_h_geom[:K],

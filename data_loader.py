@@ -48,6 +48,15 @@ class BookshelfData:
     pins_dx: jnp.ndarray             # 引脚X偏移 (P,)
     pins_dy: jnp.ndarray             # 引脚Y偏移 (P,)
 
+    def boundary_from_terminals(self) -> Tuple[float, float]:
+        """从 terminal 节点的外包矩形估算 interposer 边界 (width, height)。"""
+        mask = self.is_terminal == 1
+        tx = jnp.where(mask, self.x_fixed, 0)
+        ty = jnp.where(mask, self.y_fixed, 0)
+        tw = jnp.where(mask, self.widths, 0)
+        th = jnp.where(mask, self.heights, 0)
+        return float(jnp.max(tx + tw)), float(jnp.max(ty + th))
+
 
 class BookshelfLoader:
     """Bookshelf文件加载器"""

@@ -17,15 +17,15 @@ class MCTSPlacer:
     
     def __init__(self, bench, movable_indices: jnp.ndarray, sorted_modules: jnp.ndarray,
                  boundary_width: float, boundary_height: float,
-                 oob_penalty_alpha: float = 1.0):
+                 rollout_leaves: int = 128):
         """初始化MCTS布局器
-        
+
         Args:
             bench: BookshelfData对象
             movable_indices: 可移动模块的索引
             sorted_modules: 排序后的模块
-            boundary_width / boundary_height: interposer 边界（用于 OOB 惩罚）
-            oob_penalty_alpha: OOB 软惩罚系数；0 等同旧行为，1~5 对紧约束场景有效
+            boundary_width / boundary_height: interposer 边界（用于合法性判定）
+            rollout_leaves: 每次 MCTS expansion 下并行 rollout 到终态的 leaves 数（vmap 维度）
         """
         # 存储必要的数据
         self.movable_indices = movable_indices
@@ -35,7 +35,7 @@ class MCTSPlacer:
         self.bench = bench  # 存储bench对象
         self.boundary_width = jnp.float32(boundary_width)
         self.boundary_height = jnp.float32(boundary_height)
-        self.oob_penalty_alpha = jnp.float32(oob_penalty_alpha)
+        self.rollout_leaves = int(rollout_leaves)
         
         # 创建状态管理器
         self.state_manager = StateManager()
@@ -58,60 +58,51 @@ class MCTSPlacer:
         return logits
 
     def _eval_terminal(self, state: PlacementState):
-        """在 terminal state 上计算 (hpwl, oob_ratio, penalized_reward, is_legal)。
+        """在 terminal state 上计算 (hpwl, reward, is_legal)。
 
-        - oob_ratio: bbox 越界量归一化到 interposer 尺寸，clip 到 10 防爆
-        - penalized = -hpwl * (1 + alpha * oob_ratio)；合法时 penalty=1 退化成 -hpwl
-        - is_legal: oob_ratio == 0
+        reward = -hpwl；is_legal 通过 movable bbox 是否落在 interposer 边界内判定。
+        非法解不做软惩罚，留给下游 _extract_per_batch_best 按 is_legal 过滤即可。
         """
         x, y, w, h, pdx, pdy = self.placement_solver.compute_final_positions(
             state.s1, state.s2, state.orientations)
         hpwl = PlacementSolver._calculate_hpwl_core(
             x, y, w, h, self.bench.nets_ptr, self.bench.pins_nodes, pdx, pdy)
-        
+
         mi = self.movable_indices
-        bw = self.boundary_width
-        bh = self.boundary_height
-        x_over  = jnp.maximum(0.0, jnp.max(x[mi] + w[mi]) - bw)
-        x_under = jnp.maximum(0.0, -jnp.min(x[mi]))
-        y_over  = jnp.maximum(0.0, jnp.max(y[mi] + h[mi]) - bh)
-        y_under = jnp.maximum(0.0, -jnp.min(y[mi]))
-        oob_ratio = (x_over + x_under) / bw + (y_over + y_under) / bh
-        oob_ratio = jnp.minimum(oob_ratio, 10.0)
-        
-        penalty = 1.0 + self.oob_penalty_alpha * oob_ratio
-        penalized = -hpwl * penalty
-        is_legal = oob_ratio <= 0.0
-        return hpwl, oob_ratio, penalized, is_legal
+        is_legal = ((jnp.min(x[mi]) >= 0.0) &
+                    (jnp.min(y[mi]) >= 0.0) &
+                    (jnp.max(x[mi] + w[mi]) <= self.boundary_width) &
+                    (jnp.max(y[mi] + h[mi]) <= self.boundary_height))
+        return hpwl, -hpwl, is_legal
 
     def _single_rollout(self, state: PlacementState, rng_key):
-        """单次 rollout 到终态，返回 (leaf_state, penalized_reward, is_legal)。"""
+        """单次 rollout 到终态，返回 (leaf_state, reward, is_legal)。reward = -hpwl。"""
         def cond(a):
             state, key = a
             return state.step < 3 * self.num_movable
-            
+
         def step(a):
             state, key = a
             key, subkey = jax.random.split(key)
             action = jax.random.categorical(subkey, self.policy_function(state))
             state = self.state_manager.apply_action(state, action, self.num_movable, self.sorted_modules)
             return state, key
-            
-        leaf, _ = jax.lax.while_loop(cond, step, (state, rng_key))
-        _, _, penalized, is_legal = self._eval_terminal(leaf)
-        return leaf, penalized, is_legal
 
-    def rollout(self, state: PlacementState, rng_key, n_rollouts: int = 256):
+        leaf, _ = jax.lax.while_loop(cond, step, (state, rng_key))
+        _, reward, is_legal = self._eval_terminal(leaf)
+        return leaf, reward, is_legal
+
+    def rollout(self, state: PlacementState, rng_key, n_rollouts: int = 128):
         """K 次并行 rollout 到终态。
-        
+
         返回：
-          mcts_value: K 次 rollout 的 penalized reward 最大值，作为 MCTS 节点 value
+          mcts_value: K 次 rollout reward (=-hpwl) 的最大值，作为 MCTS 节点 value
                       （不做合法优先，保持 UCT 的"上界估计"语义）。
-          roll_value: **合法优先** 挑出的那次 rollout 的 penalized reward，
+          roll_value: **合法优先** 挑出的那次 rollout 的 reward，
                       与 best_leaf 来自同一次 rollout，供 extraction 排序使用。
           best_leaf: 同上 idx 对应的终态；合法存在时取合法里 -HPWL 最大者，
-                     否则退回 penalized argmax。
-        
+                     否则退回 reward argmax。
+
         解耦 mcts_value 和 roll_value 的原因：
         - MCTS 搜索喜欢紧上界（max pvals） → 分支选择更有效
         - Extraction 排序要 roll_value 与 roll_s1/s2/ori 指向同一次 rollout，
@@ -119,28 +110,28 @@ class MCTSPlacer:
         """
         keys = jax.random.split(rng_key, n_rollouts)
         leaves, pvals, legal = jax.vmap(lambda k: self._single_rollout(state, k))(keys)
-        
-        # MCTS value：不做合法优先，取全体 penalized 的 max
+
+        # MCTS value：不做合法优先，取全体 reward 的 max
         mcts_value = jnp.max(pvals)
-        
+
         # best_leaf：合法优先挑 idx；roll_value 用同一个 idx 保证一致
-        legal_vals = jnp.where(legal, pvals, -jnp.inf)  # 合法时 penalty=1 → val=-hpwl
+        legal_vals = jnp.where(legal, pvals, -jnp.inf)
         best_legal = jnp.argmax(legal_vals)
         best_any   = jnp.argmax(pvals)
         has_legal  = jnp.any(legal)
         best_idx   = jnp.where(has_legal, best_legal, best_any)
-        
+
         roll_value = pvals[best_idx]
         best_leaf  = jax.tree_util.tree_map(lambda x: x[best_idx], leaves)
         return mcts_value, roll_value, best_leaf
-    
+
     def compute_reward(self, state: PlacementState) -> jnp.ndarray:
-        """计算奖励（仅在终端状态）——带 OOB 软惩罚。"""
+        """计算奖励（仅在终端状态）：reward = -hpwl。"""
         is_terminal = self.state_manager.is_terminal(state, self.num_movable)
         
         def terminal_reward():
-            _, _, penalized, _ = self._eval_terminal(state)
-            return penalized
+            _, r, _ = self._eval_terminal(state)
+            return r
             
         reward = jax.lax.cond(
             is_terminal,
@@ -168,9 +159,10 @@ class MCTSPlacer:
             reward = self.compute_reward(new_state)
             
             # 从 new_state 出发做 rollout：
-            # - mcts_value：全体 rollout penalized max，喂给 MCTS 做上界估计
+            # - mcts_value：全体 rollout reward max，喂给 MCTS 做上界估计
             # - roll_value + best_leaf：合法优先配对，存到 embedding 供后处理
-            mcts_value, roll_value, best_leaf = self.rollout(new_state, rng_key)
+            mcts_value, roll_value, best_leaf = self.rollout(
+                new_state, rng_key, n_rollouts=self.rollout_leaves)
             
             new_state = new_state._replace(
                 roll_s1=best_leaf.s1,
